@@ -115,6 +115,14 @@ type Config struct {
 	RandomizeClientPort bool
 	Taildrop            TaildropConfig
 	AWG                 AWGConfig
+	Mesh                MeshConfig
+
+	// MeshSnapshotJSON returns the current mesh view serialised as
+	// JSON (the value of CapabilityMesh in each node's CapMap) or
+	// nil when the mesh subsystem is disabled. Injected at runtime
+	// by app startup so the mapper can read a fresh snapshot on
+	// every map request without import cycles.
+	MeshSnapshotJSON func() []byte `json:"-"`
 
 	CLI CLIConfig
 
@@ -254,6 +262,50 @@ func (c AWGConfig) IsZero() bool { return c == AWGConfig{} }
 // CapabilityAmneziaWG is the tailcfg.NodeCapability under which
 // headscale publishes AmneziaWG params in each client's SelfNode.CapMap.
 const CapabilityAmneziaWG tailcfg.NodeCapability = "benavex.com/cap/amneziawg"
+
+// CapabilityMesh is the tailcfg.NodeCapability under which headscale
+// publishes the current mesh view (peer list + current crown) so that
+// clients can fail over to another control server without depending on
+// DNS after first contact.
+const CapabilityMesh tailcfg.NodeCapability = "benavex.com/cap/mesh"
+
+// MeshConfig declares this headscale's identity in a multi-server mesh
+// and the static peer list it should probe. Leave SelfName empty to
+// disable the crown-election subsystem entirely.
+type MeshConfig struct {
+	// SelfName is a stable short label (e.g. "de1", "nl1") used in
+	// crown tiebreaks and MapResponse mesh info. Required when Peers
+	// is non-empty.
+	SelfName string `mapstructure:"self_name"`
+
+	// SelfURL is the URL other headscale instances reach this one at.
+	// Typically the same as server_url but may differ behind a proxy.
+	// If empty, falls back to Config.ServerURL.
+	SelfURL string `mapstructure:"self_url"`
+
+	// ProbeInterval is how often each peer is probed. Defaults to 30s.
+	ProbeInterval time.Duration `mapstructure:"probe_interval"`
+
+	// OfflineAfter is how long a peer must stay unreachable before it
+	// is considered offline for crown calculation. Defaults to 90s.
+	OfflineAfter time.Duration `mapstructure:"offline_after"`
+
+	// Peers is the static list of sibling headscale instances.
+	Peers []MeshPeerConfig `mapstructure:"peers"`
+}
+
+// MeshPeerConfig identifies a sibling headscale instance.
+type MeshPeerConfig struct {
+	Name string `mapstructure:"name"`
+	URL  string `mapstructure:"url"`
+}
+
+// IsEnabled reports whether the mesh subsystem should start. Disabled
+// when no SelfName or no Peers are configured so single-server
+// installations pay nothing.
+func (m MeshConfig) IsEnabled() bool {
+	return m.SelfName != "" && len(m.Peers) > 0
+}
 
 type CLIConfig struct {
 	Address  string
@@ -443,6 +495,12 @@ func LoadConfig(path string, isFile bool) error {
 	viper.SetDefault("awg.h2", "")
 	viper.SetDefault("awg.h3", "")
 	viper.SetDefault("awg.h4", "")
+
+	viper.SetDefault("mesh.self_name", "")
+	viper.SetDefault("mesh.self_url", "")
+	viper.SetDefault("mesh.probe_interval", "30s")
+	viper.SetDefault("mesh.offline_after", "90s")
+	viper.SetDefault("mesh.peers", []map[string]string{})
 
 	viper.SetDefault("node.expiry", "0")
 	viper.SetDefault("node.ephemeral.inactivity_timeout", "120s")
@@ -721,6 +779,45 @@ func logtailConfig() LogTailConfig {
 	return LogTailConfig{
 		Enabled: enabled,
 	}
+}
+
+// meshConfigFromViper reads the `mesh:` section from viper. serverURL is
+// the already-resolved top-level server_url; used as the default for
+// SelfURL so operators don't have to repeat themselves.
+func meshConfigFromViper(serverURL string) MeshConfig {
+	mc := MeshConfig{
+		SelfName:      viper.GetString("mesh.self_name"),
+		SelfURL:       viper.GetString("mesh.self_url"),
+		ProbeInterval: viper.GetDuration("mesh.probe_interval"),
+		OfflineAfter:  viper.GetDuration("mesh.offline_after"),
+	}
+	if mc.SelfURL == "" {
+		mc.SelfURL = serverURL
+	}
+	if mc.ProbeInterval <= 0 {
+		mc.ProbeInterval = 30 * time.Second
+	}
+	if mc.OfflineAfter <= 0 {
+		mc.OfflineAfter = 90 * time.Second
+	}
+
+	// Unmarshal peers into a structured slice; viper returns
+	// []map[string]any when the YAML has inline mappings.
+	raw := viper.Get("mesh.peers")
+	entries, _ := raw.([]any)
+	for _, e := range entries {
+		m, ok := e.(map[string]any)
+		if !ok {
+			continue
+		}
+		name, _ := m["name"].(string)
+		url, _ := m["url"].(string)
+		if name == "" || url == "" {
+			continue
+		}
+		mc.Peers = append(mc.Peers, MeshPeerConfig{Name: name, URL: url})
+	}
+	return mc
 }
 
 func policyConfig() PolicyConfig {
@@ -1214,6 +1311,7 @@ func LoadServerConfig() (*Config, error) {
 			H3:   viper.GetString("awg.h3"),
 			H4:   viper.GetString("awg.h4"),
 		},
+		Mesh: meshConfigFromViper(serverURL),
 
 		Policy: policyConfig(),
 

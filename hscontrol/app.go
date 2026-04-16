@@ -33,6 +33,7 @@ import (
 	derpServer "github.com/juanfont/headscale/hscontrol/derp/server"
 	"github.com/juanfont/headscale/hscontrol/dns"
 	"github.com/juanfont/headscale/hscontrol/mapper"
+	"github.com/juanfont/headscale/hscontrol/mesh"
 	"github.com/juanfont/headscale/hscontrol/state"
 	"github.com/juanfont/headscale/hscontrol/types"
 	"github.com/juanfont/headscale/hscontrol/types/change"
@@ -104,6 +105,10 @@ type Headscale struct {
 	authProvider   AuthProvider
 	mapBatcher     *mapper.Batcher
 
+	// Mesh is non-nil iff the optional multi-headscale crown-election
+	// subsystem is configured (see types.MeshConfig.IsEnabled).
+	Mesh *mesh.State
+
 	clientStreamsOpen sync.WaitGroup
 }
 
@@ -138,6 +143,15 @@ func NewHeadscale(cfg *types.Config) (*Headscale, error) {
 		noisePrivateKey:   noisePrivateKey,
 		clientStreamsOpen: sync.WaitGroup{},
 		state:             s,
+		Mesh:              mesh.New(cfg.Mesh),
+	}
+
+	// Expose the mesh snapshot to the mapper via Config so TailNode
+	// can publish it into each client's CapMap without an import cycle.
+	if app.Mesh != nil {
+		cfg.MeshSnapshotJSON = func() []byte {
+			return mesh.MarshalSnapshot(app.Mesh.Snapshot())
+		}
 	}
 
 	// Initialize ephemeral garbage collector
@@ -480,6 +494,7 @@ func (h *Headscale) createRouter(grpcMux *grpcRuntime.ServeMux) *chi.Mux {
 	r.Get("/health", h.HealthHandler)
 	r.Get("/version", h.VersionHandler)
 	r.Get("/key", h.KeyHandler)
+	r.Method(http.MethodGet, "/mesh/info", mesh.Handler(h.Mesh))
 	r.Get("/register/{auth_id}", h.authProvider.RegisterHandler)
 	r.Get("/auth/{auth_id}", h.authProvider.AuthHandler)
 
@@ -609,6 +624,12 @@ func (h *Headscale) Serve() error {
 	defer scheduleCancel()
 
 	go h.scheduledTasks(scheduleCtx)
+
+	// Mesh peer-health prober. No-op when the mesh subsystem is
+	// disabled (no peers configured).
+	if h.Mesh != nil {
+		go h.Mesh.Prober(scheduleCtx, h.cfg.Mesh)
+	}
 
 	if zl.GlobalLevel() == zl.TraceLevel {
 		zerolog.RespLog = true

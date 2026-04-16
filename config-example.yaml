@@ -446,6 +446,23 @@ taildrop:
   # Tagged devices and cross-user transfers are not permitted by Tailscale clients.
   enabled: true
 
+# Multi-headscale mesh / crown-election configuration.
+# When multiple headscale instances should coordinate, give each a
+# stable short name and list its siblings. Each instance probes the
+# others every probe_interval and publishes the view to every client
+# as the node capability "benavex.com/cap/mesh". Clients use this to
+# fail over to another control server without external DNS.
+# Leave self_name empty to disable (default).
+#
+# mesh:
+#   self_name: "de1"
+#   self_url: "http://168.222.252.155:8080"   # optional, defaults to server_url
+#   probe_interval: 30s
+#   offline_after: 90s
+#   peers:
+#     - name: "nl1"
+#       url: "http://194.87.49.70:8080"
+
 # AmneziaWG obfuscation parameters.
 # When set, headscale publishes these to every node via the node capability
 # "benavex.com/cap/amneziawg". The tailscale-awg client applies them to the

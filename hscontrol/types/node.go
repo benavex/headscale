@@ -1172,6 +1172,15 @@ func (nv NodeView) TailNode(
 		}
 	}
 
+	// Mesh view: list of peer control servers and the currently-elected
+	// crown. Lets clients fail over to another server without DNS.
+	// Injected by app startup via [Config.MeshSnapshotJSON].
+	if cfg.MeshSnapshotJSON != nil {
+		if raw := cfg.MeshSnapshotJSON(); len(raw) > 0 {
+			capMap[CapabilityMesh] = []tailcfg.RawMessage{tailcfg.RawMessage(raw)}
+		}
+	}
+
 	tNode := tailcfg.Node{
 		//nolint:gosec // G115: NodeID values are within int64 range
 		ID:       tailcfg.NodeID(nv.ID()),
