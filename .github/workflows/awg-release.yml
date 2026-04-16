@@ -1,0 +1,79 @@
+name: awg-release
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/awg-release.yml'
+      - 'go.mod'
+      - 'go.sum'
+      - 'cmd/**'
+      - 'hscontrol/**'
+      - 'proto/**'
+      - 'gen/**'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        goarch: [amd64, arm64]
+      fail-fast: false
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Build headscale
+        env:
+          GOOS: linux
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: 0
+        run: |
+          mkdir -p dist
+          go build \
+            -trimpath \
+            -ldflags="-s -w" \
+            -o dist/headscale-linux-${{ matrix.goarch }} \
+            ./cmd/headscale
+          (cd dist && sha256sum headscale-linux-${{ matrix.goarch }} > sha256-${{ matrix.goarch }}.txt)
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: headscale-awg-linux-${{ matrix.goarch }}
+          path: dist/*
+          retention-days: 14
+
+  release:
+    needs: build
+    if: github.event_name == 'workflow_dispatch' || github.event_name == 'push'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: List artifacts
+        run: ls -la artifacts/
+
+      - name: Create or update rolling release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: awg-latest
+        run: |
+          gh release delete "$TAG" --yes --cleanup-tag --repo "$GITHUB_REPOSITORY" 2>/dev/null || true
+          gh release create "$TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "AWG headscale (rolling)" \
+            --notes "Linux headscale binaries with AmneziaWG obfuscation param distribution. Commit ${{ github.sha }}." \
+            artifacts/*
