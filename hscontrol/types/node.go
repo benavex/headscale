@@ -1178,7 +1178,12 @@ func (nv NodeView) TailNode(
 	if cfg.MeshSnapshotJSON != nil {
 		if raw := cfg.MeshSnapshotJSON(); len(raw) > 0 {
 			capMap[CapabilityMesh] = []tailcfg.RawMessage{tailcfg.RawMessage(raw)}
+			log.Debug().Int("bytes", len(raw)).Msg("TailNode: published mesh snapshot cap")
+		} else {
+			log.Debug().Msg("TailNode: mesh snapshot returned empty")
 		}
+	} else {
+		log.Debug().Msg("TailNode: MeshSnapshotJSON nil in cfg")
 	}
 
 	tNode := tailcfg.Node{
