@@ -114,6 +114,7 @@ type Config struct {
 	LogTail             LogTailConfig
 	RandomizeClientPort bool
 	Taildrop            TaildropConfig
+	AWG                 AWGConfig
 
 	CLI CLIConfig
 
@@ -234,6 +235,25 @@ type LogTailConfig struct {
 type TaildropConfig struct {
 	Enabled bool
 }
+
+// AWGConfig holds AmneziaWG obfuscation parameters that headscale
+// distributes to every node via MapResponse.SelfNode.CapMap under the
+// key [CapabilityAmneziaWG]. Clients apply them to the underlying
+// amneziawg-go device so all peers in the tailnet share wire-format
+// settings. Zero values are omitted from the UAPI write on the client.
+type AWGConfig struct {
+	Jc, Jmin, Jmax int
+	S1, S2, S3, S4 int
+	H1, H2, H3, H4 string
+}
+
+// IsZero reports whether the obfuscation config is empty, i.e. whether
+// headscale should suppress the capability key entirely.
+func (c AWGConfig) IsZero() bool { return c == AWGConfig{} }
+
+// CapabilityAmneziaWG is the tailcfg.NodeCapability under which
+// headscale publishes AmneziaWG params in each client's SelfNode.CapMap.
+const CapabilityAmneziaWG tailcfg.NodeCapability = "benavex.com/cap/amneziawg"
 
 type CLIConfig struct {
 	Address  string
@@ -411,6 +431,18 @@ func LoadConfig(path string, isFile bool) error {
 	viper.SetDefault("logtail.enabled", false)
 	viper.SetDefault("randomize_client_port", false)
 	viper.SetDefault("taildrop.enabled", true)
+
+	viper.SetDefault("awg.jc", 0)
+	viper.SetDefault("awg.jmin", 0)
+	viper.SetDefault("awg.jmax", 0)
+	viper.SetDefault("awg.s1", 0)
+	viper.SetDefault("awg.s2", 0)
+	viper.SetDefault("awg.s3", 0)
+	viper.SetDefault("awg.s4", 0)
+	viper.SetDefault("awg.h1", "")
+	viper.SetDefault("awg.h2", "")
+	viper.SetDefault("awg.h3", "")
+	viper.SetDefault("awg.h4", "")
 
 	viper.SetDefault("node.expiry", "0")
 	viper.SetDefault("node.ephemeral.inactivity_timeout", "120s")
@@ -1168,6 +1200,19 @@ func LoadServerConfig() (*Config, error) {
 		RandomizeClientPort: randomizeClientPort,
 		Taildrop: TaildropConfig{
 			Enabled: viper.GetBool("taildrop.enabled"),
+		},
+		AWG: AWGConfig{
+			Jc:   viper.GetInt("awg.jc"),
+			Jmin: viper.GetInt("awg.jmin"),
+			Jmax: viper.GetInt("awg.jmax"),
+			S1:   viper.GetInt("awg.s1"),
+			S2:   viper.GetInt("awg.s2"),
+			S3:   viper.GetInt("awg.s3"),
+			S4:   viper.GetInt("awg.s4"),
+			H1:   viper.GetString("awg.h1"),
+			H2:   viper.GetString("awg.h2"),
+			H3:   viper.GetString("awg.h3"),
+			H4:   viper.GetString("awg.h4"),
 		},
 
 		Policy: policyConfig(),

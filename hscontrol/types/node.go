@@ -1,6 +1,7 @@
 package types
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/netip"
@@ -1160,6 +1161,16 @@ func (nv NodeView) TailNode(
 	// without a matching grant these attributes alone do nothing.
 	capMap[tailcfg.NodeAttrsTaildriveShare] = []tailcfg.RawMessage{}
 	capMap[tailcfg.NodeAttrsTaildriveAccess] = []tailcfg.RawMessage{}
+
+	// AmneziaWG obfuscation params — distributed to every node so the
+	// whole tailnet shares wire-format settings. Suppressed when unset
+	// so the client falls back to stock WireGuard behavior (or to its
+	// TS_AWG_* env vars if the operator sets them locally).
+	if !cfg.AWG.IsZero() {
+		if raw, err := json.Marshal(cfg.AWG); err == nil {
+			capMap[CapabilityAmneziaWG] = []tailcfg.RawMessage{tailcfg.RawMessage(raw)}
+		}
+	}
 
 	tNode := tailcfg.Node{
 		//nolint:gosec // G115: NodeID values are within int64 range

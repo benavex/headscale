@@ -445,6 +445,28 @@ taildrop:
   # When enabled, nodes can send files to other nodes owned by the same user.
   # Tagged devices and cross-user transfers are not permitted by Tailscale clients.
   enabled: true
+
+# AmneziaWG obfuscation parameters.
+# When set, headscale publishes these to every node via the node capability
+# "benavex.com/cap/amneziawg". The tailscale-awg client applies them to the
+# underlying amneziawg-go device so all peers share the same wire format.
+# All keys default to 0/"" — leave unset to fall back to stock WireGuard.
+# Jc/Jmin/Jmax control junk packet count/size; S1–S4 control init-packet
+# padding; H1–H4 are replacement magic header values (decimal strings).
+#
+# awg:
+#   jc: 5
+#   jmin: 40
+#   jmax: 70
+#   s1: 15
+#   s2: 20
+#   s3: 0
+#   s4: 0
+#   h1: "1113904652"
+#   h2: "2113904602"
+#   h3: "2313904676"
+#   h4: "2413904679"
+
 # Advanced performance tuning parameters.
 # The defaults are carefully chosen and should rarely need adjustment.
 # Only modify these if you have identified a specific performance issue.
