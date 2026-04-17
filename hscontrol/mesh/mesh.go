@@ -58,6 +58,16 @@ type State struct {
 	self      PeerStatus
 	peers     []PeerStatus
 	offlineAt time.Duration // peer is offline after this long without a probe success
+
+	// lastCrown is the crown name from the previous probe cycle.
+	// Used to trigger OnBecameCrown exactly once per transition.
+	lastCrown string
+
+	// OnBecameCrown is invoked synchronously whenever this instance
+	// newly wins the crown (i.e. the election output transitions
+	// from some other name to self). Set by the app after New().
+	// In-flight probes do not block on it.
+	OnBecameCrown func()
 }
 
 // New constructs a State seeded from cfg. Returns nil if the mesh
@@ -175,9 +185,35 @@ func (s *State) probeAll(ctx context.Context) {
 	}
 	wg.Wait()
 
+	// Recompute the crown and fire OnBecameCrown on a rising edge.
+	// Done under the same lock so callers observe a consistent
+	// transition (no double-fires from a concurrent probe).
 	s.mu.Lock()
+	newCrown := electCrown(s.self, applyOfflineDecay(s.peers, s.offlineAt, time.Now()))
+	becameCrown := newCrown == s.self.Name && s.lastCrown != "" && s.lastCrown != s.self.Name
+	s.lastCrown = newCrown
+	cb := s.OnBecameCrown
 	s.peers = results
 	s.mu.Unlock()
+
+	if becameCrown && cb != nil {
+		log.Info().Str("self", s.self.Name).Msg("mesh: became crown")
+		cb()
+	}
+}
+
+// applyOfflineDecay returns a copy of peers with Online=false for any
+// peer whose LastSeen is older than offlineAt. Kept separate so both
+// Snapshot() and probeAll() use identical rules.
+func applyOfflineDecay(peers []PeerStatus, offlineAt time.Duration, now time.Time) []PeerStatus {
+	out := make([]PeerStatus, len(peers))
+	for i, p := range peers {
+		if !p.LastSeen.IsZero() && now.Sub(p.LastSeen) > offlineAt {
+			p.Online = false
+		}
+		out[i] = p
+	}
+	return out
 }
 
 // probeClient is a module-level HTTP client with tight timeouts so a

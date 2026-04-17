@@ -152,6 +152,18 @@ func NewHeadscale(cfg *types.Config) (*Headscale, error) {
 		cfg.MeshSnapshotJSON = func() []byte {
 			return mesh.MarshalSnapshot(app.Mesh.Snapshot())
 		}
+
+		// When this instance becomes the crown, the in-memory
+		// NodeStore cache may be stale (the prior crown could have
+		// written rows we never saw). The simplest correct fix is
+		// to exit and let the process manager (docker / systemd)
+		// restart us with a fresh cache rehydrated from the DB.
+		// Writes in flight are lost but clients retry via the
+		// mesh-failover watchdog on their end.
+		app.Mesh.OnBecameCrown = func() {
+			log.Warn().Msg("mesh: became crown; exiting to rehydrate state from DB")
+			os.Exit(0)
+		}
 	}
 
 	// Initialize ephemeral garbage collector
