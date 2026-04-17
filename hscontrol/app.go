@@ -40,6 +40,7 @@ import (
 	"github.com/juanfont/headscale/hscontrol/util"
 	zerolog "github.com/philip-bui/grpc-zerolog"
 	"github.com/pkg/profile"
+	"github.com/spf13/viper"
 	zl "github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
 	"github.com/sasha-s/go-deadlock"
@@ -153,14 +154,46 @@ func NewHeadscale(cfg *types.Config) (*Headscale, error) {
 			return mesh.MarshalSnapshot(app.Mesh.Snapshot())
 		}
 
-		// When this instance becomes the crown, the in-memory
-		// NodeStore cache may be stale (the prior crown could have
-		// written rows we never saw). The simplest correct fix is
-		// to exit and let the process manager (docker / systemd)
-		// restart us with a fresh cache rehydrated from the DB.
-		// Writes in flight are lost but clients retry via the
-		// mesh-failover watchdog on their end.
+		// Self-health probe: measure local write-path latency against
+		// whichever postgres we're currently pointed at. A slow or
+		// failing probe drops the self score so a faster sibling
+		// wins the crown without the operator having to trip a
+		// circuit breaker manually.
+		app.Mesh.SelfHealthProbe = func(ctx context.Context) (time.Duration, error) {
+			start := time.Now()
+			if err := app.state.PingDB(ctx); err != nil {
+				return 0, err
+			}
+			return time.Since(start), nil
+		}
+
+		// Crown-self-transition handler. Two scenarios:
+		//  (a) Remote primary is still responsive — a sibling
+		//      headscale process died but the DB is fine. We
+		//      just exit so docker restarts us with a fresh
+		//      NodeStore rehydrated from the primary.
+		//  (b) Remote primary is unreachable — blackout. We
+		//      promote our local standby (if configured) and
+		//      rewrite the on-disk config so the restart runs
+		//      against the new primary.
 		app.Mesh.OnBecameCrown = func() {
+			plan := mesh.PromotePlan{
+				RemoteHost:    cfg.Database.Postgres.Host,
+				RemotePort:    cfg.Database.Postgres.Port,
+				LocalHost:     cfg.Mesh.LocalDBHost,
+				LocalPort:     cfg.Database.Postgres.Port,
+				LocalUser:     cfg.Database.Postgres.User,
+				LocalPassword: cfg.Database.Postgres.Pass,
+				LocalDB:       cfg.Database.Postgres.Name,
+				ConfigPath:    viper.ConfigFileUsed(),
+			}
+			if plan.LocalHost != "" && plan.ConfigPath != "" {
+				ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+				if err := mesh.RunPromote(ctx, plan); err != nil {
+					log.Error().Err(err).Msg("mesh: promote failed; continuing with exit")
+				}
+				cancel()
+			}
 			log.Warn().Msg("mesh: became crown; exiting to rehydrate state from DB")
 			os.Exit(0)
 		}

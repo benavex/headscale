@@ -459,6 +459,23 @@ taildrop:
 #   self_url: "http://168.222.252.155:8080"   # optional, defaults to server_url
 #   probe_interval: 30s
 #   offline_after: 90s
+#
+#   # Above this probe round-trip the peer's score starts decaying so
+#   # a slow-but-alive sibling loses the crown to a faster one.
+#   latency_alert: 2s
+#
+#   # Hostname or unix-socket path for a LOCAL postgres standby on this
+#   # VPS. When the configured primary (database.postgres.host) goes
+#   # unreachable AND this instance wins the crown, the runtime will:
+#   #   1. confirm the remote primary really is dead
+#   #   2. open a connection here as the headscale role
+#   #   3. run pg_promote() to make this standby a primary
+#   #   4. rewrite database.postgres.host in this file to local_db_host
+#   #   5. exit so docker restarts pointed at the fresh primary
+#   # Leave empty to disable auto-promotion (the process will crash-loop
+#   # instead while the remote primary stays dead).
+#   local_db_host: "127.0.0.1"
+#
 #   peers:
 #     - name: "nl1"
 #       url: "http://194.87.49.70:8080"

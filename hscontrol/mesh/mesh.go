@@ -21,6 +21,7 @@ package mesh
 import (
 	"context"
 	"encoding/json"
+	"math"
 	"net/http"
 	"sort"
 	"sync"
@@ -30,6 +31,7 @@ import (
 	"github.com/rs/zerolog/log"
 )
 
+
 // PeerStatus is the mesh-view of one headscale instance (self or sibling).
 type PeerStatus struct {
 	Name     string    `json:"name"`
@@ -38,6 +40,12 @@ type PeerStatus struct {
 	LastSeen time.Time `json:"last_seen,omitempty"`
 	Uptime   float64   `json:"uptime_seconds"`
 	Score    float64   `json:"score"`
+
+	// LatencyMs is the most recent probe round-trip time for this peer
+	// (meaningless for self unless SelfHealthProbe supplies it).
+	// Reported for observability; the election uses Score, which is
+	// derived from this value via [scoreFromLatency].
+	LatencyMs float64 `json:"latency_ms,omitempty"`
 }
 
 // Snapshot is the full mesh view computed locally and published to
@@ -53,11 +61,12 @@ type Snapshot struct {
 // State holds the live mesh view for this headscale. Safe for
 // concurrent reads via Snapshot().
 type State struct {
-	mu        sync.RWMutex
-	started   time.Time
-	self      PeerStatus
-	peers     []PeerStatus
-	offlineAt time.Duration // peer is offline after this long without a probe success
+	mu           sync.RWMutex
+	started      time.Time
+	self         PeerStatus
+	peers        []PeerStatus
+	offlineAt    time.Duration // peer offline after this long w/o a good probe
+	latencyAlert time.Duration // above this, peer score starts decaying
 
 	// lastCrown is the crown name from the previous probe cycle.
 	// Used to trigger OnBecameCrown exactly once per transition.
@@ -68,6 +77,13 @@ type State struct {
 	// from some other name to self). Set by the app after New().
 	// In-flight probes do not block on it.
 	OnBecameCrown func()
+
+	// SelfHealthProbe, if set, is called each probe cycle to measure
+	// the local write path's latency (typically a SELECT 1 against the
+	// configured postgres primary). A slow or failing probe demotes
+	// this instance's score so a faster sibling wins the crown. If
+	// nil, the self score stays pinned at 1.0.
+	SelfHealthProbe func(ctx context.Context) (time.Duration, error)
 }
 
 // New constructs a State seeded from cfg. Returns nil if the mesh
@@ -82,8 +98,9 @@ func New(cfg types.MeshConfig) *State {
 		peers = append(peers, PeerStatus{Name: p.Name, URL: p.URL})
 	}
 	return &State{
-		started:   now,
-		offlineAt: cfg.OfflineAfter,
+		started:      now,
+		offlineAt:    cfg.OfflineAfter,
+		latencyAlert: cfg.LatencyAlert,
 		self: PeerStatus{
 			Name:   cfg.SelfName,
 			URL:    cfg.SelfURL,
@@ -92,6 +109,17 @@ func New(cfg types.MeshConfig) *State {
 		},
 		peers: peers,
 	}
+}
+
+// scoreFromLatency returns a score in (0, 1] that decays exponentially
+// above the alert threshold. latency == alert → score ≈ 0.37; latency
+// == 2*alert → score ≈ 0.14; latency == alert/2 → score ≈ 0.82. A peer
+// that responds "instantly" still caps at 1.0.
+func scoreFromLatency(latency, alert time.Duration) float64 {
+	if alert <= 0 || latency <= 0 {
+		return 1.0
+	}
+	return math.Exp(-float64(latency) / float64(alert))
 }
 
 // Snapshot returns the current mesh view. Safe for repeated calls.
@@ -172,6 +200,7 @@ func (s *State) probeAll(ctx context.Context) {
 	s.mu.RLock()
 	peers := make([]PeerStatus, len(s.peers))
 	copy(peers, s.peers)
+	healthProbe := s.SelfHealthProbe
 	s.mu.RUnlock()
 
 	results := make([]PeerStatus, len(peers))
@@ -185,11 +214,27 @@ func (s *State) probeAll(ctx context.Context) {
 	}
 	wg.Wait()
 
-	// Recompute the crown and fire OnBecameCrown on a rising edge.
-	// Done under the same lock so callers observe a consistent
-	// transition (no double-fires from a concurrent probe).
+	// Self score from an optional local-write-path health probe.
+	// Slow or failing probe → low self score → faster sibling wins.
+	selfScore := 1.0
+	selfLatencyMs := 0.0
+	if healthProbe != nil {
+		hctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		d, err := healthProbe(hctx)
+		cancel()
+		if err != nil {
+			selfScore = 0
+			selfLatencyMs = 5000
+		} else {
+			selfScore = scoreFromLatency(d, s.latencyAlert)
+			selfLatencyMs = float64(d.Microseconds()) / 1000.0
+		}
+	}
+
 	s.mu.Lock()
-	newCrown := electCrown(s.self, applyOfflineDecay(s.peers, s.offlineAt, time.Now()))
+	s.self.Score = selfScore
+	s.self.LatencyMs = selfLatencyMs
+	newCrown := electCrown(s.self, applyOfflineDecay(results, s.offlineAt, time.Now()))
 	becameCrown := newCrown == s.self.Name && s.lastCrown != "" && s.lastCrown != s.self.Name
 	s.lastCrown = newCrown
 	cb := s.OnBecameCrown
@@ -223,14 +268,17 @@ var probeClient = &http.Client{
 }
 
 // probeOne fetches /mesh/info from p and updates its status. Returns a
-// new PeerStatus keeping the static Name/URL.
+// new PeerStatus keeping the static Name/URL. Score is derived locally
+// from round-trip latency so a peer that lies about its own self-score
+// cannot win the election by inflating it.
 func (s *State) probeOne(ctx context.Context, p PeerStatus) PeerStatus {
-	out := PeerStatus{Name: p.Name, URL: p.URL, LastSeen: p.LastSeen, Score: p.Score}
+	out := PeerStatus{Name: p.Name, URL: p.URL, LastSeen: p.LastSeen, Score: p.Score, LatencyMs: p.LatencyMs}
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, p.URL+"/mesh/info", nil)
 	if err != nil {
 		return out
 	}
+	start := time.Now()
 	resp, err := probeClient.Do(req)
 	if err != nil {
 		return out
@@ -244,25 +292,14 @@ func (s *State) probeOne(ctx context.Context, p PeerStatus) PeerStatus {
 	if err := json.NewDecoder(resp.Body).Decode(&snap); err != nil {
 		return out
 	}
+	latency := time.Since(start)
 
-	// Peer is alive and self-reports its score + uptime.
 	out.Online = true
 	out.LastSeen = time.Now()
 	out.Uptime = snap.Self.Uptime
-	// Clamp external score so a malicious/broken peer can't claim
-	// more than our local uptime-based ceiling.
-	out.Score = clamp01(snap.Self.Score)
+	out.LatencyMs = float64(latency.Microseconds()) / 1000.0
+	out.Score = scoreFromLatency(latency, s.latencyAlert)
 	return out
-}
-
-func clamp01(v float64) float64 {
-	if v < 0 || v != v { // NaN guard
-		return 0
-	}
-	if v > 1 {
-		return 1
-	}
-	return v
 }
 
 // MarshalSnapshot returns snap encoded as JSON. Returns nil on

@@ -290,6 +290,24 @@ type MeshConfig struct {
 	// is considered offline for crown calculation. Defaults to 90s.
 	OfflineAfter time.Duration `mapstructure:"offline_after"`
 
+	// LatencyAlert is the probe-latency threshold above which a
+	// peer's score starts to decay; defaults to 2s. Used by the
+	// crown-election subsystem so a slow-but-alive peer can lose the
+	// crown to a faster sibling.
+	LatencyAlert time.Duration `mapstructure:"latency_alert"`
+
+	// LocalDBHost is the hostname (or unix socket path) to reach a
+	// local postgres standby on this VPS. When the configured primary
+	// becomes unreachable and this instance wins the crown, the
+	// app-level handler connects here, runs pg_promote() to turn the
+	// standby into a primary, rewrites the on-disk config's
+	// database.postgres.host to this value, and exits so the next
+	// restart runs against a writable DB.
+	//
+	// Leave empty to disable automatic promotion — the process will
+	// just crash-loop until the remote primary recovers.
+	LocalDBHost string `mapstructure:"local_db_host"`
+
 	// Peers is the static list of sibling headscale instances.
 	Peers []MeshPeerConfig `mapstructure:"peers"`
 }
@@ -500,6 +518,8 @@ func LoadConfig(path string, isFile bool) error {
 	viper.SetDefault("mesh.self_url", "")
 	viper.SetDefault("mesh.probe_interval", "30s")
 	viper.SetDefault("mesh.offline_after", "90s")
+	viper.SetDefault("mesh.latency_alert", "2s")
+	viper.SetDefault("mesh.local_db_host", "")
 	viper.SetDefault("mesh.peers", []map[string]string{})
 
 	viper.SetDefault("node.expiry", "0")
@@ -790,6 +810,8 @@ func meshConfigFromViper(serverURL string) MeshConfig {
 		SelfURL:       viper.GetString("mesh.self_url"),
 		ProbeInterval: viper.GetDuration("mesh.probe_interval"),
 		OfflineAfter:  viper.GetDuration("mesh.offline_after"),
+		LatencyAlert:  viper.GetDuration("mesh.latency_alert"),
+		LocalDBHost:   viper.GetString("mesh.local_db_host"),
 	}
 	if mc.SelfURL == "" {
 		mc.SelfURL = serverURL
@@ -799,6 +821,9 @@ func meshConfigFromViper(serverURL string) MeshConfig {
 	}
 	if mc.OfflineAfter <= 0 {
 		mc.OfflineAfter = 90 * time.Second
+	}
+	if mc.LatencyAlert <= 0 {
+		mc.LatencyAlert = 2 * time.Second
 	}
 
 	// Unmarshal peers into a structured slice; viper returns
