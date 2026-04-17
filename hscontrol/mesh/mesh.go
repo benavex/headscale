@@ -312,9 +312,12 @@ func (s *State) Prober(ctx context.Context, cfg types.MeshConfig) {
 	if s == nil {
 		return
 	}
+	s.mu.RLock()
+	peerCount := len(s.peers)
+	s.mu.RUnlock()
 	log.Info().
 		Str("self", cfg.SelfName).
-		Int("peers", len(cfg.Peers)).
+		Int("peers", peerCount).
 		Dur("interval", cfg.ProbeInterval).
 		Msg("mesh: prober started")
 
