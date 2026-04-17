@@ -23,6 +23,8 @@ import (
 	"encoding/json"
 	"math"
 	"net/http"
+	"os"
+	"path/filepath"
 	"sort"
 	"sync"
 	"time"
@@ -84,6 +86,15 @@ type State struct {
 	// this instance's score so a faster sibling wins the crown. If
 	// nil, the self score stays pinned at 1.0.
 	SelfHealthProbe func(ctx context.Context) (time.Duration, error)
+
+	// persistPath, if non-empty, is the file where dynamically-joined
+	// peers are mirrored so they survive restarts. Written atomically
+	// on every addPeerLocked that introduces a new URL.
+	persistPath string
+
+	// clusterSecret is the HMAC key used to verify /mesh/join requests.
+	// Empty → join endpoint is disabled.
+	clusterSecret string
 }
 
 // New constructs a State seeded from cfg. Returns nil if the mesh
@@ -97,10 +108,12 @@ func New(cfg types.MeshConfig) *State {
 	for _, p := range cfg.Peers {
 		peers = append(peers, PeerStatus{Name: p.Name, URL: p.URL})
 	}
-	return &State{
-		started:      now,
-		offlineAt:    cfg.OfflineAfter,
-		latencyAlert: cfg.LatencyAlert,
+	s := &State{
+		started:       now,
+		offlineAt:     cfg.OfflineAfter,
+		latencyAlert:  cfg.LatencyAlert,
+		persistPath:   cfg.PeersStatePath,
+		clusterSecret: cfg.ClusterSecret,
 		self: PeerStatus{
 			Name:   cfg.SelfName,
 			URL:    cfg.SelfURL,
@@ -108,6 +121,131 @@ func New(cfg types.MeshConfig) *State {
 			Score:  1.0,
 		},
 		peers: peers,
+	}
+	if s.persistPath != "" && s.persistPath != "-" {
+		s.mu.Lock()
+		for _, p := range loadPersistedPeers(s.persistPath) {
+			s.addPeerLocked(p.Name, p.URL)
+		}
+		s.mu.Unlock()
+	}
+	return s
+}
+
+// addPeerLocked adds (name, url) to the peer list if the URL is not
+// already present and is not self. Returns true when a new entry was
+// actually added. Caller must hold s.mu (write).
+func (s *State) addPeerLocked(name, url string) bool {
+	if url == "" || url == s.self.URL {
+		return false
+	}
+	for _, p := range s.peers {
+		if p.URL == url {
+			return false
+		}
+	}
+	s.peers = append(s.peers, PeerStatus{Name: name, URL: url})
+	return true
+}
+
+// AddPeer is the concurrent-safe entry point used by /mesh/join and the
+// gossip merge in probeAll. Persists the new peer set to disk when a
+// persistPath is configured.
+func (s *State) AddPeer(name, url string) bool {
+	s.mu.Lock()
+	added := s.addPeerLocked(name, url)
+	peersCopy := append([]PeerStatus(nil), s.peers...)
+	s.mu.Unlock()
+	if added {
+		log.Info().Str("name", name).Str("url", url).Msg("mesh: peer added")
+		s.persistPeers(peersCopy)
+	}
+	return added
+}
+
+// peersForSnapshot returns the current peer list (copy) without
+// invoking any election logic. Used by /mesh/join responses so the
+// caller can seed its own peer list.
+func (s *State) peersForSnapshot() []PeerStatus {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	out := make([]PeerStatus, len(s.peers))
+	copy(out, s.peers)
+	return out
+}
+
+// SelfSummary returns Name/URL so the join handler can echo identity
+// back to the caller without exposing live probe state.
+func (s *State) SelfSummary() (name, url string) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.self.Name, s.self.URL
+}
+
+// ClusterSecret returns the configured HMAC secret or empty string.
+// Exposed so the app layer can gate /mesh/join mounting on "secret
+// configured".
+func (s *State) ClusterSecret() string {
+	if s == nil {
+		return ""
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.clusterSecret
+}
+
+type persistedPeers struct {
+	Peers []MeshPeerRecord `json:"peers"`
+}
+
+// MeshPeerRecord is the on-disk form of a dynamically-joined peer.
+// Kept separate from PeerStatus so probe-time fields (LastSeen, Score,
+// LatencyMs) aren't persisted — they rehydrate naturally on next probe.
+type MeshPeerRecord struct {
+	Name string `json:"name"`
+	URL  string `json:"url"`
+}
+
+func loadPersistedPeers(path string) []MeshPeerRecord {
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		if !os.IsNotExist(err) {
+			log.Warn().Err(err).Str("path", path).Msg("mesh: peers.state read failed")
+		}
+		return nil
+	}
+	var pp persistedPeers
+	if err := json.Unmarshal(raw, &pp); err != nil {
+		log.Warn().Err(err).Str("path", path).Msg("mesh: peers.state parse failed")
+		return nil
+	}
+	return pp.Peers
+}
+
+func (s *State) persistPeers(peers []PeerStatus) {
+	if s.persistPath == "" || s.persistPath == "-" {
+		return
+	}
+	records := make([]MeshPeerRecord, 0, len(peers))
+	for _, p := range peers {
+		records = append(records, MeshPeerRecord{Name: p.Name, URL: p.URL})
+	}
+	raw, err := json.MarshalIndent(persistedPeers{Peers: records}, "", "  ")
+	if err != nil {
+		log.Warn().Err(err).Msg("mesh: peers.state marshal failed")
+		return
+	}
+	tmp := s.persistPath + ".tmp"
+	if err := os.MkdirAll(filepath.Dir(s.persistPath), 0o755); err != nil {
+		log.Warn().Err(err).Str("path", s.persistPath).Msg("mesh: peers.state mkdir failed")
+		return
+	}
+	if err := os.WriteFile(tmp, raw, 0o644); err != nil {
+		log.Warn().Err(err).Str("path", tmp).Msg("mesh: peers.state write failed")
+		return
+	}
+	if err := os.Rename(tmp, s.persistPath); err != nil {
+		log.Warn().Err(err).Str("path", s.persistPath).Msg("mesh: peers.state rename failed")
 	}
 }
 
@@ -201,18 +339,45 @@ func (s *State) probeAll(ctx context.Context) {
 	peers := make([]PeerStatus, len(s.peers))
 	copy(peers, s.peers)
 	healthProbe := s.SelfHealthProbe
+	selfName := s.self.Name
+	selfURL := s.self.URL
 	s.mu.RUnlock()
 
 	results := make([]PeerStatus, len(peers))
+	discovered := make([][]MeshPeerRecord, len(peers))
 	var wg sync.WaitGroup
 	for i := range peers {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
-			results[i] = s.probeOne(ctx, peers[i])
+			results[i], discovered[i] = s.probeOne(ctx, peers[i])
 		}(i)
 	}
 	wg.Wait()
+
+	// Gossip: merge peers observed in any sibling's snapshot that we
+	// don't know about yet. New entries are added to results so the
+	// snapshot we publish this cycle already reflects them.
+	existing := map[string]bool{selfURL: true}
+	for _, p := range results {
+		existing[p.URL] = true
+	}
+	var gossiped []PeerStatus
+	for _, batch := range discovered {
+		for _, d := range batch {
+			if d.URL == "" || existing[d.URL] {
+				continue
+			}
+			existing[d.URL] = true
+			entry := PeerStatus{Name: d.Name, URL: d.URL}
+			gossiped = append(gossiped, entry)
+			log.Info().Str("self", selfName).Str("name", d.Name).Str("url", d.URL).
+				Msg("mesh: peer discovered via gossip")
+		}
+	}
+	if len(gossiped) > 0 {
+		results = append(results, gossiped...)
+	}
 
 	// Self score from an optional local-write-path health probe.
 	// Slow or failing probe → low self score → faster sibling wins.
@@ -239,7 +404,12 @@ func (s *State) probeAll(ctx context.Context) {
 	s.lastCrown = newCrown
 	cb := s.OnBecameCrown
 	s.peers = results
+	peersCopy := append([]PeerStatus(nil), s.peers...)
 	s.mu.Unlock()
+
+	if len(gossiped) > 0 {
+		s.persistPeers(peersCopy)
+	}
 
 	if becameCrown && cb != nil {
 		log.Info().Str("self", s.self.Name).Msg("mesh: became crown")
@@ -270,27 +440,29 @@ var probeClient = &http.Client{
 // probeOne fetches /mesh/info from p and updates its status. Returns a
 // new PeerStatus keeping the static Name/URL. Score is derived locally
 // from round-trip latency so a peer that lies about its own self-score
-// cannot win the election by inflating it.
-func (s *State) probeOne(ctx context.Context, p PeerStatus) PeerStatus {
+// cannot win the election by inflating it. The second return value is
+// the set of peers the sibling reports in its own snapshot (including
+// its self), used by probeAll for gossip discovery of new members.
+func (s *State) probeOne(ctx context.Context, p PeerStatus) (PeerStatus, []MeshPeerRecord) {
 	out := PeerStatus{Name: p.Name, URL: p.URL, LastSeen: p.LastSeen, Score: p.Score, LatencyMs: p.LatencyMs}
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, p.URL+"/mesh/info", nil)
 	if err != nil {
-		return out
+		return out, nil
 	}
 	start := time.Now()
 	resp, err := probeClient.Do(req)
 	if err != nil {
-		return out
+		return out, nil
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return out
+		return out, nil
 	}
 
 	var snap Snapshot
 	if err := json.NewDecoder(resp.Body).Decode(&snap); err != nil {
-		return out
+		return out, nil
 	}
 	latency := time.Since(start)
 
@@ -299,7 +471,22 @@ func (s *State) probeOne(ctx context.Context, p PeerStatus) PeerStatus {
 	out.Uptime = snap.Self.Uptime
 	out.LatencyMs = float64(latency.Microseconds()) / 1000.0
 	out.Score = scoreFromLatency(latency, s.latencyAlert)
-	return out
+
+	// The sibling's self entry is the primary gossip signal: if it's a
+	// peer we don't yet know about, probeAll will add it. We also
+	// forward its peer list so transitive discovery converges in one
+	// round even on large meshes.
+	discovered := make([]MeshPeerRecord, 0, 1+len(snap.Peers))
+	if snap.Self.URL != "" {
+		discovered = append(discovered, MeshPeerRecord{Name: snap.Self.Name, URL: snap.Self.URL})
+	}
+	for _, sp := range snap.Peers {
+		if sp.URL == "" {
+			continue
+		}
+		discovered = append(discovered, MeshPeerRecord{Name: sp.Name, URL: sp.URL})
+	}
+	return out, discovered
 }
 
 // MarshalSnapshot returns snap encoded as JSON. Returns nil on

@@ -540,6 +540,7 @@ func (h *Headscale) createRouter(grpcMux *grpcRuntime.ServeMux) *chi.Mux {
 	r.Get("/version", h.VersionHandler)
 	r.Get("/key", h.KeyHandler)
 	r.Method(http.MethodGet, "/mesh/info", mesh.Handler(h.Mesh))
+	r.Method(http.MethodPost, "/mesh/join", mesh.JoinHandler(h.Mesh))
 	r.Get("/register/{auth_id}", h.authProvider.RegisterHandler)
 	r.Get("/auth/{auth_id}", h.authProvider.AuthHandler)
 
@@ -673,6 +674,18 @@ func (h *Headscale) Serve() error {
 	// Mesh peer-health prober. No-op when the mesh subsystem is
 	// disabled (no peers configured).
 	if h.Mesh != nil {
+		// Self-join a fresh node against its bootstrap URL. Does
+		// nothing if bootstrap_url or cluster_secret is unset, so
+		// statically-configured clusters pay no cost.
+		if err := mesh.SelfJoin(
+			h.Mesh,
+			h.cfg.Mesh.BootstrapURL,
+			h.cfg.Mesh.ClusterSecret,
+			h.cfg.Mesh.SelfName,
+			h.cfg.Mesh.SelfURL,
+		); err != nil {
+			log.Warn().Err(err).Msg("mesh: self-join failed; will rely on gossip / retry at next start")
+		}
 		go h.Mesh.Prober(scheduleCtx, h.cfg.Mesh)
 	}
 

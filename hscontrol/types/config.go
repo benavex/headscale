@@ -7,6 +7,7 @@ import (
 	"net/netip"
 	"net/url"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -308,8 +309,28 @@ type MeshConfig struct {
 	// just crash-loop until the remote primary recovers.
 	LocalDBHost string `mapstructure:"local_db_host"`
 
-	// Peers is the static list of sibling headscale instances.
+	// Peers is the static list of sibling headscale instances. It
+	// may be empty; dynamically-joined peers are merged at runtime.
 	Peers []MeshPeerConfig `mapstructure:"peers"`
+
+	// ClusterSecret is the shared HMAC secret used to sign join
+	// requests. Any node holding this secret may join the mesh by
+	// POSTing a signed payload to /mesh/join on any existing member.
+	// Empty disables dynamic join (only statically-configured peers
+	// participate).
+	ClusterSecret string `mapstructure:"cluster_secret"`
+
+	// BootstrapURL, on a freshly-provisioned node, is the URL of any
+	// existing mesh member. When set AND Peers is empty AND
+	// ClusterSecret is set, this instance self-joins at startup by
+	// POSTing its name+url signed with ClusterSecret. After that the
+	// peer list is driven by the join response + gossip.
+	BootstrapURL string `mapstructure:"bootstrap_url"`
+
+	// PeersStatePath is where runtime-discovered peers are persisted
+	// across restarts. Defaults to peers.state.json beside the config
+	// file. Set to "-" to disable persistence entirely.
+	PeersStatePath string `mapstructure:"peers_state_path"`
 }
 
 // MeshPeerConfig identifies a sibling headscale instance.
@@ -319,10 +340,15 @@ type MeshPeerConfig struct {
 }
 
 // IsEnabled reports whether the mesh subsystem should start. Disabled
-// when no SelfName or no Peers are configured so single-server
-// installations pay nothing.
+// when no SelfName is set so single-server installations pay nothing.
+// Having either static peers or a dynamic-join path (bootstrap + cluster
+// secret) is enough to enable — empty peers + no bootstrap just means
+// "wait for someone to join me".
 func (m MeshConfig) IsEnabled() bool {
-	return m.SelfName != "" && len(m.Peers) > 0
+	if m.SelfName == "" {
+		return false
+	}
+	return len(m.Peers) > 0 || m.ClusterSecret != ""
 }
 
 type CLIConfig struct {
@@ -520,6 +546,9 @@ func LoadConfig(path string, isFile bool) error {
 	viper.SetDefault("mesh.offline_after", "90s")
 	viper.SetDefault("mesh.latency_alert", "2s")
 	viper.SetDefault("mesh.local_db_host", "")
+	viper.SetDefault("mesh.cluster_secret", "")
+	viper.SetDefault("mesh.bootstrap_url", "")
+	viper.SetDefault("mesh.peers_state_path", "")
 	viper.SetDefault("mesh.peers", []map[string]string{})
 
 	viper.SetDefault("node.expiry", "0")
@@ -806,12 +835,15 @@ func logtailConfig() LogTailConfig {
 // SelfURL so operators don't have to repeat themselves.
 func meshConfigFromViper(serverURL string) MeshConfig {
 	mc := MeshConfig{
-		SelfName:      viper.GetString("mesh.self_name"),
-		SelfURL:       viper.GetString("mesh.self_url"),
-		ProbeInterval: viper.GetDuration("mesh.probe_interval"),
-		OfflineAfter:  viper.GetDuration("mesh.offline_after"),
-		LatencyAlert:  viper.GetDuration("mesh.latency_alert"),
-		LocalDBHost:   viper.GetString("mesh.local_db_host"),
+		SelfName:       viper.GetString("mesh.self_name"),
+		SelfURL:        viper.GetString("mesh.self_url"),
+		ProbeInterval:  viper.GetDuration("mesh.probe_interval"),
+		OfflineAfter:   viper.GetDuration("mesh.offline_after"),
+		LatencyAlert:   viper.GetDuration("mesh.latency_alert"),
+		LocalDBHost:    viper.GetString("mesh.local_db_host"),
+		ClusterSecret:  viper.GetString("mesh.cluster_secret"),
+		BootstrapURL:   viper.GetString("mesh.bootstrap_url"),
+		PeersStatePath: viper.GetString("mesh.peers_state_path"),
 	}
 	if mc.SelfURL == "" {
 		mc.SelfURL = serverURL
@@ -824,6 +856,13 @@ func meshConfigFromViper(serverURL string) MeshConfig {
 	}
 	if mc.LatencyAlert <= 0 {
 		mc.LatencyAlert = 2 * time.Second
+	}
+	// Default peers_state_path to peers.state.json beside the config
+	// file so operators get durable dynamic-peer state for free.
+	if mc.PeersStatePath == "" {
+		if cfg := viper.ConfigFileUsed(); cfg != "" {
+			mc.PeersStatePath = filepath.Join(filepath.Dir(cfg), "peers.state.json")
+		}
 	}
 
 	// Unmarshal peers into a structured slice; viper returns

@@ -476,6 +476,24 @@ taildrop:
 #   # instead while the remote primary stays dead).
 #   local_db_host: "127.0.0.1"
 #
+#   # Shared HMAC secret. Any headscale holding this secret can POST a
+#   # signed payload to /mesh/join on any existing member to be added
+#   # to the cluster at runtime, without restarting peers. Leave empty
+#   # to lock the mesh down to the static `peers:` list below.
+#   # cluster_secret: "change-me-to-a-long-random-string"
+#
+#   # On a freshly-provisioned node, point this at any existing member's
+#   # URL and that member will accept a self-join request at startup.
+#   # Unused after the first successful join.
+#   # bootstrap_url: "http://168.222.252.155:8080"
+#
+#   # Where dynamically-joined peers are mirrored so they survive
+#   # restarts. Defaults to peers.state.json beside this config file;
+#   # set to "-" to disable persistence (gossip only).
+#   # peers_state_path: ""
+#
+#   # Static peer list. Optional when cluster_secret is set — dynamic
+#   # joins populate this at runtime.
 #   peers:
 #     - name: "nl1"
 #       url: "http://194.87.49.70:8080"
