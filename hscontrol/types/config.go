@@ -331,6 +331,15 @@ type MeshConfig struct {
 	// across restarts. Defaults to peers.state.json beside the config
 	// file. Set to "-" to disable persistence entirely.
 	PeersStatePath string `mapstructure:"peers_state_path"`
+
+	// DDNSUpdateURL, if set, is GETed once this instance newly wins
+	// the crown. The URL must already include credentials; headscale
+	// appends nothing. Omit &ip= and the provider (e.g. DuckDNS) will
+	// use the source IP of the request — which is this VPS's public
+	// IP, i.e. the new crown. Used so tailscale clients and freshly
+	// provisioned mesh members can always reach the current crown via
+	// a single stable hostname after first contact.
+	DDNSUpdateURL string `mapstructure:"ddns_update_url"`
 }
 
 // MeshPeerConfig identifies a sibling headscale instance.
@@ -549,6 +558,7 @@ func LoadConfig(path string, isFile bool) error {
 	viper.SetDefault("mesh.cluster_secret", "")
 	viper.SetDefault("mesh.bootstrap_url", "")
 	viper.SetDefault("mesh.peers_state_path", "")
+	viper.SetDefault("mesh.ddns_update_url", "")
 	viper.SetDefault("mesh.peers", []map[string]string{})
 
 	viper.SetDefault("node.expiry", "0")
@@ -844,6 +854,7 @@ func meshConfigFromViper(serverURL string) MeshConfig {
 		ClusterSecret:  viper.GetString("mesh.cluster_secret"),
 		BootstrapURL:   viper.GetString("mesh.bootstrap_url"),
 		PeersStatePath: viper.GetString("mesh.peers_state_path"),
+		DDNSUpdateURL:  viper.GetString("mesh.ddns_update_url"),
 	}
 	if mc.SelfURL == "" {
 		mc.SelfURL = serverURL

@@ -177,6 +177,17 @@ func NewHeadscale(cfg *types.Config) (*Headscale, error) {
 		//      rewrite the on-disk config so the restart runs
 		//      against the new primary.
 		app.Mesh.OnBecameCrown = func() {
+			// Fire DDNS update first so propagation (which can take
+			// minutes for DuckDNS) overlaps with the promote + exit
+			// + restart cycle rather than starting after it.
+			if url := cfg.Mesh.DDNSUpdateURL; url != "" {
+				ctx, cancel := context.WithTimeout(context.Background(), 12*time.Second)
+				if err := mesh.UpdateDDNS(ctx, url); err != nil {
+					log.Warn().Err(err).Msg("mesh: DDNS update failed; clients may see stale bootstrap IP until it retries")
+				}
+				cancel()
+			}
+
 			plan := mesh.PromotePlan{
 				RemoteHost:    cfg.Database.Postgres.Host,
 				RemotePort:    cfg.Database.Postgres.Port,

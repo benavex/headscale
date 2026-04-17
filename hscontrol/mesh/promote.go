@@ -8,14 +8,52 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"io"
 	"net"
+	"net/http"
 	"os"
+	"strings"
 	"time"
 
 	_ "github.com/jackc/pgx/v5/stdlib" // registers "pgx" driver
 	"github.com/rs/zerolog/log"
 	"gopkg.in/yaml.v3"
 )
+
+// UpdateDDNS GETs rawURL once so the provider (DuckDNS or compatible)
+// repoints the bootstrap hostname at this VPS. Called from the
+// crown-self-transition handler so a client booting with a stale
+// bootstrap IP always resolves the name to the current crown.
+//
+// rawURL must already carry credentials. We deliberately do NOT
+// append `&ip=` — DuckDNS uses the source IP of the request, which
+// is this VPS's public IP. Returning an error here is logged by the
+// caller but does NOT abort the crown transition: a stale A record
+// is bad, but the mesh will still work via gossip / bootstrap_url on
+// existing peers.
+func UpdateDDNS(ctx context.Context, rawURL string) error {
+	if rawURL == "" {
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
+	if err != nil {
+		return fmt.Errorf("ddns: build request: %w", err)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("ddns: get: %w", err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 256))
+	trimmed := strings.TrimSpace(string(body))
+	if resp.StatusCode != http.StatusOK || trimmed != "OK" {
+		return fmt.Errorf("ddns: provider rejected update: status=%s body=%q", resp.Status, trimmed)
+	}
+	log.Warn().Msg("mesh: DDNS updated; bootstrap hostname now points at this crown")
+	return nil
+}
 
 // PromotePlan captures everything needed to take over as the primary
 // postgres writer when the configured remote primary stops responding.

@@ -492,6 +492,13 @@ taildrop:
 #   # set to "-" to disable persistence (gossip only).
 #   # peers_state_path: ""
 #
+#   # DDNS update URL. When this instance newly wins the crown we GET
+#   # this URL once so the bootstrap hostname (the one baked into
+#   # tailscale clients and new mesh members' `bootstrap_url`) now
+#   # resolves to this VPS. Omit any &ip= — DuckDNS uses the source
+#   # IP of the request, which is this VPS.
+#   # ddns_update_url: "https://www.duckdns.org/update?domains=hs42.duckdns.org&token=xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
+#
 #   # Static peer list. Optional when cluster_secret is set — dynamic
 #   # joins populate this at runtime.
 #   peers:
