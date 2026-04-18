@@ -447,6 +447,16 @@ type MeshConfig struct {
 	// provisioned mesh members can always reach the current crown via
 	// a single stable hostname after first contact.
 	DDNSUpdateURL string `mapstructure:"ddns_update_url"`
+
+	// ExitNodeName is the tailnet hostname of the per-VPS tailscaled
+	// that runs alongside this headscale and advertises an exit-node
+	// route (--advertise-exit-node). Published in the per-PeerStatus
+	// snapshot so clients in `--exit-node=auto:follow-crown` mode can
+	// translate "current crown" into "tailnet node to send egress to".
+	// Empty disables follow-crown for this peer (clients keep their
+	// previously-pinned exit). Each headscale sets its own value;
+	// siblings learn it through probes.
+	ExitNodeName string `mapstructure:"exit_node_name"`
 }
 
 // MeshPeerConfig identifies a sibling headscale instance.
@@ -666,6 +676,7 @@ func LoadConfig(path string, isFile bool) error {
 	viper.SetDefault("mesh.bootstrap_url", "")
 	viper.SetDefault("mesh.peers_state_path", "")
 	viper.SetDefault("mesh.ddns_update_url", "")
+	viper.SetDefault("mesh.exit_node_name", "")
 	viper.SetDefault("mesh.peers", []map[string]string{})
 
 	viper.SetDefault("node.expiry", "0")
@@ -979,6 +990,7 @@ func meshConfigFromViper(serverURL string) MeshConfig {
 		BootstrapURL:   viper.GetString("mesh.bootstrap_url"),
 		PeersStatePath: viper.GetString("mesh.peers_state_path"),
 		DDNSUpdateURL:  viper.GetString("mesh.ddns_update_url"),
+		ExitNodeName:   viper.GetString("mesh.exit_node_name"),
 	}
 	if mc.SelfURL == "" {
 		mc.SelfURL = serverURL

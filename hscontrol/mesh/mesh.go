@@ -63,6 +63,14 @@ type PeerStatus struct {
 	// tandem with NoisePubHex. The client uses it to verify a sibling
 	// belongs to the pinned cluster before rotating ControlURL to it.
 	ClusterSigHex string `json:"cluster_sig,omitempty"`
+
+	// ExitNodeName is the tailnet hostname of the per-VPS tailscaled
+	// that runs alongside this headscale and advertises an exit-node
+	// route. Empty when the operator hasn't configured one. Clients
+	// in `--exit-node=auto:follow-crown` mode look up the netmap node
+	// with this hostname and pin egress to it whenever this peer is
+	// the elected crown.
+	ExitNodeName string `json:"exit_node_name,omitempty"`
 }
 
 // Snapshot is the full mesh view computed locally and published to
@@ -136,10 +144,11 @@ func New(cfg types.MeshConfig) *State {
 		persistPath:   cfg.PeersStatePath,
 		clusterSecret: cfg.ClusterSecret,
 		self: PeerStatus{
-			Name:   cfg.SelfName,
-			URL:    cfg.SelfURL,
-			Online: true,
-			Score:  1.0,
+			Name:         cfg.SelfName,
+			URL:          cfg.SelfURL,
+			Online:       true,
+			Score:        1.0,
+			ExitNodeName: cfg.ExitNodeName,
 		},
 		peers: peers,
 	}
@@ -543,6 +552,11 @@ func (s *State) probeOne(ctx context.Context, p PeerStatus) (PeerStatus, []MeshP
 	// clients will refuse to rotate to it.
 	out.NoisePubHex = snap.Self.NoisePubHex
 	out.ClusterSigHex = snap.Self.ClusterSigHex
+
+	// Same propagation rule for the per-peer exit-node hostname:
+	// follow-crown clients translate the elected crown's name into
+	// "tailnet node to send egress to" by reading this field.
+	out.ExitNodeName = snap.Self.ExitNodeName
 
 	// The sibling's self entry is the primary gossip signal: if it's a
 	// peer we don't yet know about, probeAll will add it. We also
