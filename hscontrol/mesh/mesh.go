@@ -716,7 +716,35 @@ var probeClient = &http.Client{
 //     seed lastCrown on cold start when this instance has no opinion
 //     yet.
 func (s *State) probeOne(ctx context.Context, p PeerStatus) (PeerStatus, []MeshPeerRecord, string) {
-	out := PeerStatus{Name: p.Name, URL: p.URL, LastSeen: p.LastSeen, Score: p.Score, LatencyMs: p.LatencyMs}
+	// Carry the previous PeerStatus's static identity + topology fields
+	// so a transient probe failure (timeout, blackhole, decode error)
+	// doesn't blank them in the next published Snapshot. Without this,
+	// after one failed probe the CapMap distributed to clients shows
+	// the peer with empty NoisePubHex / ClusterSigHex, and the client's
+	// pin verifier refuses to rotate to it ("peer has no cluster
+	// signature"). Reproduced 2026-04-18 R-25 with iptables blackhole.
+	//
+	// Volatile fields (Online, Uptime, ConnectedNodeIDs) are reset to
+	// zero — only the success path below sets them. Online stays false
+	// when the probe fails.
+	out := PeerStatus{
+		Name:           p.Name,
+		URL:            p.URL,
+		LastSeen:       p.LastSeen,
+		Score:          p.Score,
+		LatencyMs:      p.LatencyMs,
+		NoisePubHex:    p.NoisePubHex,
+		ClusterSigHex:  p.ClusterSigHex,
+		ExitNodeName:   p.ExitNodeName,
+		DERPRegionID:   p.DERPRegionID,
+		DERPHost:       p.DERPHost,
+		DERPPort:       p.DERPPort,
+		DERPv4:         p.DERPv4,
+		DERPv6:         p.DERPv6,
+		DERPSTUNPort:   p.DERPSTUNPort,
+		DERPRegionCode: p.DERPRegionCode,
+		DERPRegionName: p.DERPRegionName,
+	}
 
 	s.mu.RLock()
 	selfName := s.self.Name
