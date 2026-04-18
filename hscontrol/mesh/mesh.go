@@ -47,6 +47,30 @@ type PeerStatus struct {
 	Uptime   float64   `json:"uptime_seconds"`
 	Score    float64   `json:"score"`
 
+	// ConnectedNodeIDs is the set of tailnet node IDs whose long-poll
+	// session is currently held by this headscale instance. Self entry
+	// is populated from the live Connect/Disconnect set; sibling
+	// entries arrive over /mesh/info probes. Used by the mapper to
+	// answer "is peer X online anywhere in the cluster?" — without it
+	// each sibling only knows about the connections it owns and
+	// presents peers connected to a different sibling as offline.
+	ConnectedNodeIDs []uint64 `json:"connected_node_ids,omitempty"`
+
+	// DERPRegionID / DERPHost / DERPPort / DERPv4 / DERPv6 describe
+	// this peer's embedded DERP region (if any). Empty when DERP is
+	// disabled or the sibling is on an older binary. Carried so the
+	// mapper can merge sibling regions into the DERPMap shipped to
+	// clients — without it, a client whose currently-bound section
+	// dies has no DERP relay to fall back on while it rotates.
+	DERPRegionID int    `json:"derp_region_id,omitempty"`
+	DERPHost     string `json:"derp_host,omitempty"`
+	DERPPort     int    `json:"derp_port,omitempty"`
+	DERPv4       string `json:"derp_v4,omitempty"`
+	DERPv6       string `json:"derp_v6,omitempty"`
+	DERPSTUNPort int    `json:"derp_stun_port,omitempty"`
+	DERPRegionCode string `json:"derp_region_code,omitempty"`
+	DERPRegionName string `json:"derp_region_name,omitempty"`
+
 	// LatencyMs is the most recent probe round-trip time for this peer
 	// (meaningless for self unless SelfHealthProbe supplies it).
 	// Reported for observability; the election uses Score, which is
@@ -92,6 +116,12 @@ type State struct {
 	peers        []PeerStatus
 	offlineAt    time.Duration // peer offline after this long w/o a good probe
 	latencyAlert time.Duration // above this, peer score starts decaying
+
+	// connected is the live set of tailnet node IDs whose poll session
+	// is held by this instance. RecordConnect / RecordDisconnect from
+	// state.Connect/Disconnect mutate it; Snapshot() flattens it into
+	// self.ConnectedNodeIDs so siblings learn it via /mesh/info.
+	connected map[uint64]struct{}
 
 	// lastCrown is the crown name from the previous probe cycle.
 	// Used to trigger OnBecameCrown exactly once per transition.
@@ -143,6 +173,7 @@ func New(cfg types.MeshConfig) *State {
 		latencyAlert:  cfg.LatencyAlert,
 		persistPath:   cfg.PeersStatePath,
 		clusterSecret: cfg.ClusterSecret,
+		connected:     make(map[uint64]struct{}),
 		self: PeerStatus{
 			Name:         cfg.SelfName,
 			URL:          cfg.SelfURL,
@@ -251,6 +282,97 @@ func (s *State) Identity() *Identity {
 	return s.identity
 }
 
+// RecordConnect notes that a tailnet node's long-poll session is now
+// held by this headscale instance. Safe to call when s is nil. The
+// next /mesh/info probe carries this set out to siblings as
+// ConnectedNodeIDs.
+func (s *State) RecordConnect(nodeID uint64) {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	s.connected[nodeID] = struct{}{}
+	s.mu.Unlock()
+}
+
+// RecordDisconnect removes nodeID from the local connected set. Safe to
+// call when s is nil or when nodeID was never recorded.
+func (s *State) RecordDisconnect(nodeID uint64) {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	delete(s.connected, nodeID)
+	s.mu.Unlock()
+}
+
+// IsConnectedAnywhere reports whether the given tailnet node has a
+// live poll session against this headscale OR any sibling, based on
+// the latest probe cycle's gossip. Used by the mapper so a peer
+// connected to a different sibling is shown as online to clients on
+// this sibling. Returns false when s is nil.
+func (s *State) IsConnectedAnywhere(nodeID uint64) bool {
+	if s == nil {
+		return false
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if _, ok := s.connected[nodeID]; ok {
+		return true
+	}
+	for _, p := range s.peers {
+		if !p.Online {
+			continue
+		}
+		for _, id := range p.ConnectedNodeIDs {
+			if id == nodeID {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// SetSelfDERPRegion installs this instance's embedded DERP region
+// metadata on the self entry so it travels through every Snapshot().
+// Empty fields → no DERP region published. App calls this once at
+// startup after derp.GenerateRegion() succeeds.
+func (s *State) SetSelfDERPRegion(regionID int, regionCode, regionName, host string, port, stunPort int, v4, v6 string) {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	s.self.DERPRegionID = regionID
+	s.self.DERPRegionCode = regionCode
+	s.self.DERPRegionName = regionName
+	s.self.DERPHost = host
+	s.self.DERPPort = port
+	s.self.DERPSTUNPort = stunPort
+	s.self.DERPv4 = v4
+	s.self.DERPv6 = v6
+	s.mu.Unlock()
+}
+
+// SiblingDERPRegions returns the per-sibling DERP region descriptors
+// most recently observed via /mesh/info probes (excluding self;
+// caller already has the local region from its own derp config).
+// Skips siblings whose probe hasn't reported a region yet.
+func (s *State) SiblingDERPRegions() []PeerStatus {
+	if s == nil {
+		return nil
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	out := make([]PeerStatus, 0, len(s.peers))
+	for _, p := range s.peers {
+		if p.DERPRegionID == 0 || p.DERPHost == "" {
+			continue
+		}
+		out = append(out, p)
+	}
+	return out
+}
+
 type persistedPeers struct {
 	Peers []MeshPeerRecord `json:"peers"`
 }
@@ -325,6 +447,19 @@ func (s *State) Snapshot() Snapshot {
 	now := time.Now()
 	self := s.self
 	self.Uptime = now.Sub(s.started).Seconds()
+
+	// Flatten the live connected-node set into self.ConnectedNodeIDs so
+	// siblings learn it via /mesh/info. Sorted for determinism (the
+	// snapshot JSON is published into every client's CapMap, so jitter
+	// would churn netmaps unnecessarily).
+	if len(s.connected) > 0 {
+		ids := make([]uint64, 0, len(s.connected))
+		for id := range s.connected {
+			ids = append(ids, id)
+		}
+		sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
+		self.ConnectedNodeIDs = ids
+	}
 
 	peers := make([]PeerStatus, len(s.peers))
 	for i, p := range s.peers {
@@ -557,6 +692,23 @@ func (s *State) probeOne(ctx context.Context, p PeerStatus) (PeerStatus, []MeshP
 	// follow-crown clients translate the elected crown's name into
 	// "tailnet node to send egress to" by reading this field.
 	out.ExitNodeName = snap.Self.ExitNodeName
+
+	// Sibling's locally-held poll sessions, so this instance's mapper
+	// can answer "is peer X online anywhere in the cluster?" without
+	// each sibling having to write transient online state to the DB.
+	out.ConnectedNodeIDs = snap.Self.ConnectedNodeIDs
+
+	// Sibling's embedded DERP region — merged into the DERPMap shipped
+	// to clients so a client whose currently-bound section dies still
+	// has a relay alternative while it rotates.
+	out.DERPRegionID = snap.Self.DERPRegionID
+	out.DERPRegionCode = snap.Self.DERPRegionCode
+	out.DERPRegionName = snap.Self.DERPRegionName
+	out.DERPHost = snap.Self.DERPHost
+	out.DERPPort = snap.Self.DERPPort
+	out.DERPSTUNPort = snap.Self.DERPSTUNPort
+	out.DERPv4 = snap.Self.DERPv4
+	out.DERPv6 = snap.Self.DERPv6
 
 	// The sibling's self entry is the primary gossip signal: if it's a
 	// peer we don't yet know about, probeAll will add it. We also

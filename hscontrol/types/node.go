@@ -1210,7 +1210,7 @@ func (nv NodeView) TailNode(
 		Hostinfo:         nv.Hostinfo(),
 		Created:          nv.CreatedAt().UTC(),
 
-		Online: nv.IsOnline().Clone(),
+		Online: meshAwareOnline(nv, cfg),
 
 		Tags: nv.Tags().AsSlice(),
 
@@ -1227,4 +1227,22 @@ func (nv NodeView) TailNode(
 	}
 
 	return &tNode, nil
+}
+
+// meshAwareOnline returns the node's online flag for inclusion in a
+// MapResponse, OR-ed with the cluster-wide presence gossip if the
+// mesh subsystem is enabled. Without this, each headscale only
+// reports nodes it owns the poll session for as online — peers
+// connected to a sibling appear offline, which breaks ACL rules
+// keyed on "online" and follow-crown rotation eligibility.
+func meshAwareOnline(nv NodeView, cfg *Config) *bool {
+	local := nv.IsOnline().Clone()
+	if cfg == nil || cfg.MeshIsConnectedAnywhere == nil {
+		return local
+	}
+	if cfg.MeshIsConnectedAnywhere(uint64(nv.ID())) {
+		t := true
+		return &t
+	}
+	return local
 }

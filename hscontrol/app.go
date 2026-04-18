@@ -147,6 +147,41 @@ func NewHeadscale(cfg *types.Config) (*Headscale, error) {
 		Mesh:              mesh.New(cfg.Mesh),
 	}
 
+	// Wire the NodeStore-from-DB drift sync to the mapper. When a sibling
+	// headscale registers/updates/deletes a node, the next 5s reload tick
+	// here picks it up; without this hook the snapshot updates locally
+	// but no MapResponse fires, so long-poll clients connected to *this*
+	// instance keep serving a stale netmap. Closes the gap that blocked
+	// follow-crown on the test rig (opi connected to section1 didn't see
+	// exit-vps2 after exit-vps2 registered against section2).
+	s.SetOnReloadDiff(func(added, removed, modified []types.NodeID) {
+		var cs []change.Change
+		if peers := append(append([]types.NodeID(nil), added...), modified...); len(peers) > 0 {
+			cs = append(cs, change.PeersChanged("nodestore db-sync", peers...))
+		}
+		if len(removed) > 0 {
+			cs = append(cs, change.PeersRemoved(removed...))
+		}
+		if len(cs) > 0 {
+			app.Change(cs...)
+		}
+	})
+
+	// Cross-instance online-status: feed Connect/Disconnect into the
+	// mesh state so siblings learn (via /mesh/info gossip) which sibling
+	// owns each tailnet node's poll session. Without this, each
+	// sibling only knows its own connections — peers connected to a
+	// different sibling appear offline to clients here.
+	if app.Mesh != nil {
+		s.SetConnectionHooks(
+			func(id types.NodeID) { app.Mesh.RecordConnect(uint64(id)) },
+			func(id types.NodeID) { app.Mesh.RecordDisconnect(uint64(id)) },
+		)
+		cfg.MeshIsConnectedAnywhere = func(id uint64) bool {
+			return app.Mesh.IsConnectedAnywhere(id)
+		}
+	}
+
 	// Derive the cluster identity from the shared secret + this
 	// instance's noise pubkey. Done here (not inside mesh.New) because
 	// the noise key is owned by the app, not the mesh package. With no
@@ -668,6 +703,24 @@ func (h *Headscale) Serve() error {
 	if h.cfg.DERP.ServerEnabled && h.cfg.DERP.AutomaticallyAddEmbeddedDerpRegion {
 		region, _ := h.DERPServer.GenerateRegion()
 		derpMap.Regions[region.RegionID] = &region
+
+		// Publish our own embedded DERP region into the mesh snapshot so
+		// siblings can pick it up via /mesh/info and merge it into the
+		// DERPMap they ship to clients. Skipped when there's no node in
+		// the region (defensive; GenerateRegion always emits exactly one).
+		if h.Mesh != nil && len(region.Nodes) > 0 {
+			n := region.Nodes[0]
+			h.Mesh.SetSelfDERPRegion(
+				region.RegionID,
+				region.RegionCode,
+				region.RegionName,
+				n.HostName,
+				n.DERPPort,
+				n.STUNPort,
+				n.IPv4,
+				n.IPv6,
+			)
+		}
 	}
 
 	if len(derpMap.Regions) == 0 {
@@ -675,6 +728,11 @@ func (h *Headscale) Serve() error {
 	}
 
 	h.state.SetDERPMap(derpMap)
+	// Remember the base map (this instance's own regions) so the mesh
+	// merge tick below can re-overlay sibling regions on top of a clean
+	// base instead of accumulating stale entries. Captured by closure
+	// so the goroutine started further down can use it.
+	baseDERPMap := derpMap
 
 	// Start ephemeral node garbage collector and schedule all nodes
 	// that are already in the database and ephemeral. If they are still
@@ -722,6 +780,13 @@ func (h *Headscale) Serve() error {
 			log.Warn().Err(err).Msg("mesh: self-join failed; will rely on gossip / retry at next start")
 		}
 		go h.Mesh.Prober(scheduleCtx, h.cfg.Mesh)
+
+		// Cluster-DERP-fleet merge: re-overlay sibling regions onto the
+		// base map after each probe interval and emit a DERPMap change so
+		// clients pick up the new map. Without this, a client whose
+		// currently-bound section dies has no relay alternative — it can
+		// only fall back to direct UDP, which fails behind symmetric NAT.
+		go h.runDERPFleetMerge(scheduleCtx, baseDERPMap)
 	}
 
 	if zl.GlobalLevel() == zl.TraceLevel {
@@ -1194,6 +1259,99 @@ func readOrCreatePrivateKey(path string) (*key.MachinePrivate, error) {
 // ignored.
 func (h *Headscale) Change(cs ...change.Change) {
 	h.mapBatcher.AddWork(cs...)
+}
+
+// runDERPFleetMerge re-overlays sibling DERP regions (learned via
+// /mesh/info gossip) on top of base every probe interval and re-publishes
+// the merged map to clients via SetDERPMap + a DERPMap change. Cheap to
+// run unconditionally — when no sibling has a DERP region yet, the diff
+// is empty and we skip the change emit. Exits when ctx is cancelled.
+func (h *Headscale) runDERPFleetMerge(ctx context.Context, base *tailcfg.DERPMap) {
+	if h.Mesh == nil || base == nil {
+		return
+	}
+	interval := h.cfg.Mesh.ProbeInterval
+	if interval <= 0 {
+		interval = 30 * time.Second
+	}
+	t := time.NewTicker(interval)
+	defer t.Stop()
+
+	prevHash := derpMapHash(base)
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+		}
+
+		siblings := h.Mesh.SiblingDERPRegions()
+		merged := &tailcfg.DERPMap{
+			Regions:            make(map[int]*tailcfg.DERPRegion, len(base.Regions)+len(siblings)),
+			OmitDefaultRegions: base.OmitDefaultRegions,
+		}
+		for id, r := range base.Regions {
+			merged.Regions[id] = r
+		}
+		for _, sb := range siblings {
+			if sb.DERPRegionID == 0 || sb.DERPHost == "" {
+				continue
+			}
+			merged.Regions[sb.DERPRegionID] = &tailcfg.DERPRegion{
+				RegionID:   sb.DERPRegionID,
+				RegionCode: sb.DERPRegionCode,
+				RegionName: sb.DERPRegionName,
+				Nodes: []*tailcfg.DERPNode{{
+					Name:     fmt.Sprintf("%d", sb.DERPRegionID),
+					RegionID: sb.DERPRegionID,
+					HostName: sb.DERPHost,
+					DERPPort: sb.DERPPort,
+					STUNPort: sb.DERPSTUNPort,
+					IPv4:     sb.DERPv4,
+					IPv6:     sb.DERPv6,
+				}},
+			}
+		}
+		newHash := derpMapHash(merged)
+		if newHash == prevHash {
+			continue
+		}
+		prevHash = newHash
+		h.state.SetDERPMap(merged)
+		h.Change(change.DERPMap())
+		log.Info().
+			Int("regions", len(merged.Regions)).
+			Int("siblings", len(siblings)).
+			Msg("mesh: republished merged DERPMap")
+	}
+}
+
+// derpMapHash returns a coarse fingerprint of a DERPMap so the merge
+// loop can skip re-publishing when nothing actually changed.
+func derpMapHash(dm *tailcfg.DERPMap) string {
+	if dm == nil {
+		return ""
+	}
+	ids := make([]int, 0, len(dm.Regions))
+	for id := range dm.Regions {
+		ids = append(ids, id)
+	}
+	// Stable order for hashing; iteration order over the map is random.
+	for i := 1; i < len(ids); i++ {
+		for j := i; j > 0 && ids[j-1] > ids[j]; j-- {
+			ids[j-1], ids[j] = ids[j], ids[j-1]
+		}
+	}
+	var sb strings.Builder
+	for _, id := range ids {
+		r := dm.Regions[id]
+		fmt.Fprintf(&sb, "%d|%s|%s|", r.RegionID, r.RegionCode, r.RegionName)
+		for _, n := range r.Nodes {
+			fmt.Fprintf(&sb, "%s:%d:%d:%s:%s,", n.HostName, n.DERPPort, n.STUNPort, n.IPv4, n.IPv6)
+		}
+		sb.WriteByte(';')
+	}
+	return sb.String()
 }
 
 // HTTPHandler returns an http.Handler for the Headscale control server.

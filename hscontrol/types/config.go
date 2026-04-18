@@ -126,6 +126,14 @@ type Config struct {
 	// every map request without import cycles.
 	MeshSnapshotJSON func() []byte `json:"-"`
 
+	// MeshIsConnectedAnywhere, when set, returns true if the given
+	// tailnet node ID has a live poll session against any sibling in
+	// the cluster (not just this instance). The mapper OR-s this
+	// with the node's local IsOnline so peers connected to a
+	// different sibling are presented as online to clients here.
+	// Nil when the mesh subsystem is disabled.
+	MeshIsConnectedAnywhere func(uint64) bool `json:"-"`
+
 	CLI CLIConfig
 
 	Policy PolicyConfig

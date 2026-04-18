@@ -182,6 +182,23 @@ type State struct {
 	// dbSyncDone signals the periodic NodeStore-from-DB reloader to exit.
 	// Closed by Close(); the goroutine selects on it alongside its ticker.
 	dbSyncDone chan struct{}
+
+	// onReloadDiff, if set, is invoked synchronously each time the DB-sync
+	// tick observes a change in the node set (added/removed/modified). The
+	// app wires this to mapBatcher.AddWork so long-poll clients connected
+	// to this sibling pick up changes that landed against another sibling.
+	// Without this hook, the snapshot updates locally but no MapResponse
+	// fires, so existing connections stay on a stale netmap.
+	onReloadDiff func(added, removed, modified []types.NodeID)
+
+	// onConnect / onDisconnect, if set, are invoked when a node's
+	// poll session is established or torn down here. The app wires
+	// these to the mesh State so siblings learn (via /mesh/info)
+	// which sibling currently owns each tailnet node's connection.
+	// Used by the mapper's "is peer X online anywhere?" check that
+	// closes the cross-instance online-status gap.
+	onConnect    func(types.NodeID)
+	onDisconnect func(types.NodeID)
 }
 
 // NewState creates and initializes a new State instance, setting up the database,
@@ -284,9 +301,28 @@ func NewState(cfg *types.Config) (*State, error) {
 	return s, nil
 }
 
+// SetOnReloadDiff installs a callback invoked when the periodic DB-sync
+// tick observes a change in the node set. The callback runs synchronously
+// inside the sync goroutine; keep it cheap (typically just enqueues a
+// Change to the mapper batcher).
+func (s *State) SetOnReloadDiff(fn func(added, removed, modified []types.NodeID)) {
+	s.onReloadDiff = fn
+}
+
+// SetConnectionHooks installs callbacks invoked when a node's poll session
+// connects or disconnects to this instance. Used to wire mesh.State so
+// siblings can gossip the local connected-node set across the cluster.
+func (s *State) SetConnectionHooks(onConnect, onDisconnect func(types.NodeID)) {
+	s.onConnect = onConnect
+	s.onDisconnect = onDisconnect
+}
+
 // runNodeStoreDBSync periodically re-reads the nodes table and refreshes
 // the NodeStore so a sibling headscale (sharing the same postgres) sees
-// nodes registered against another instance. Exits when dbSyncDone is closed.
+// nodes registered against another instance. When the diff against the
+// previous tick is non-empty, fires the optional onReloadDiff callback so
+// the app can push a fresh netmap to long-poll clients connected here.
+// Exits when dbSyncDone is closed.
 func (s *State) runNodeStoreDBSync() {
 	t := time.NewTicker(nodeStoreDBSyncInterval)
 	defer t.Stop()
@@ -300,7 +336,50 @@ func (s *State) runNodeStoreDBSync() {
 				log.Warn().Err(err).Msg("nodestore db-sync: ListNodes failed; will retry next tick")
 				continue
 			}
+
+			// Snapshot the previous (id → updated_at) map BEFORE the swap.
+			// UpdatedAt changes on every GORM Updates(), so it's the
+			// cheapest signal that "something material happened on a
+			// sibling" without diffing every field.
+			prev := make(map[types.NodeID]time.Time)
+			for _, nv := range s.nodeStore.ListNodes().All() {
+				prev[nv.ID()] = nv.AsStruct().UpdatedAt
+			}
+
 			s.nodeStore.ReloadFromDB(nodes)
+
+			if s.onReloadDiff == nil {
+				continue
+			}
+
+			cur := make(map[types.NodeID]time.Time, len(nodes))
+			for _, n := range nodes {
+				cur[n.ID] = n.UpdatedAt
+			}
+			var added, removed, modified []types.NodeID
+			for id, ua := range cur {
+				prevUA, ok := prev[id]
+				switch {
+				case !ok:
+					added = append(added, id)
+				case !prevUA.Equal(ua):
+					modified = append(modified, id)
+				}
+			}
+			for id := range prev {
+				if _, ok := cur[id]; !ok {
+					removed = append(removed, id)
+				}
+			}
+			if len(added)+len(removed)+len(modified) == 0 {
+				continue
+			}
+			log.Debug().
+				Int("added", len(added)).
+				Int("removed", len(removed)).
+				Int("modified", len(modified)).
+				Msg("nodestore db-sync: diff observed; pushing change to mapper")
+			s.onReloadDiff(added, removed, modified)
 		}
 	}
 }
@@ -613,6 +692,10 @@ func (s *State) Connect(id types.NodeID) ([]change.Change, uint64) {
 
 	c := []change.Change{change.NodeOnlineFor(node)}
 
+	if s.onConnect != nil {
+		s.onConnect(id)
+	}
+
 	log.Info().EmbedObject(node).Msg("node connected")
 
 	// Use the node's current routes for primary route update.
@@ -686,6 +769,10 @@ func (s *State) Disconnect(id types.NodeID, gen uint64) ([]change.Change, error)
 
 	if !ok {
 		return nil, fmt.Errorf("%w: %d", ErrNodeNotFound, id)
+	}
+
+	if s.onDisconnect != nil {
+		s.onDisconnect(id)
 	}
 
 	log.Info().EmbedObject(node).Msg("node disconnected")
@@ -1687,16 +1774,9 @@ func (s *State) createAndSaveNewNode(params newNodeParams) (types.NodeView, erro
 		return types.NodeView{}, err
 	}
 
-	// Allocate new IPs
-	ipv4, ipv6, err := s.ipAlloc.Next()
-	if err != nil {
-		return types.NodeView{}, fmt.Errorf("allocating IPs: %w", err)
-	}
-
-	nodeToRegister.IPv4 = ipv4
-	nodeToRegister.IPv6 = ipv6
-
-	// Ensure unique given name if not set
+	// Ensure unique given name if not set. Done before the tx because
+	// EnsureUniqueGivenName runs its own read pass; cheap and not racy
+	// with allocation.
 	if nodeToRegister.GivenName == "" {
 		givenName, err := hsdb.EnsureUniqueGivenName(s.db.DB, nodeToRegister.Hostname)
 		if err != nil {
@@ -1706,9 +1786,20 @@ func (s *State) createAndSaveNewNode(params newNodeParams) (types.NodeView, erro
 		nodeToRegister.GivenName = givenName
 	}
 
-	// New node - database first to get ID, then NodeStore
+	// Allocate IPs and INSERT the node row in a single tx so the
+	// pg_advisory_xact_lock taken by NextInTx covers the whole "read
+	// existing IPs → claim → save" critical section. Without this,
+	// sibling headscales sharing one postgres can hand out the same
+	// IP to two nodes (race window between read and save).
 	savedNode, err := hsdb.Write(s.db.DB, func(tx *gorm.DB) (*types.Node, error) {
-		err := tx.Save(&nodeToRegister).Error
+		ipv4, ipv6, err := s.ipAlloc.NextInTx(tx)
+		if err != nil {
+			return nil, fmt.Errorf("allocating IPs: %w", err)
+		}
+		nodeToRegister.IPv4 = ipv4
+		nodeToRegister.IPv6 = ipv6
+
+		err = tx.Save(&nodeToRegister).Error
 		if err != nil {
 			return nil, fmt.Errorf("saving node: %w", err)
 		}
