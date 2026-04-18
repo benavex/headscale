@@ -473,16 +473,43 @@ func (s *State) Snapshot() Snapshot {
 	return Snapshot{
 		Self:    self,
 		Peers:   peers,
-		Crown:   electCrown(self, peers),
+		Crown:   electCrown(self, peers, s.lastCrown, nil),
 		Updated: now,
 	}
 }
 
 // electCrown returns the name of the currently-elected crown server.
-// Highest Score wins; ties broken by lexicographic Name. Only online
-// servers are eligible. If the caller is the only healthy server left,
-// it crowns itself without hesitation.
-func electCrown(self PeerStatus, peers []PeerStatus) string {
+//
+// Two-phase decision:
+//   - Stickiness: if a previously-known crown (from our own last election
+//     OR observed in any sibling's snapshot) is still healthy, keep it.
+//     This is what CLAUDE.md mandates: when a degraded primary recovers
+//     and rejoins, it must accept the cluster's current crown rather
+//     than fight for it back.
+//   - Cold election: when no sticky candidate exists or the previous
+//     crown is no longer healthy, fall back to highest-Score with lex
+//     tiebreak on Name. Only online servers are eligible.
+//
+// The Score input to the cold election must be symmetric across
+// siblings (peer self-reported, not locally-measured RTT) — otherwise
+// every node sees self.Score > peer.Score from its own viewpoint and
+// crowns itself. See probeOne for where Score is sourced.
+func electCrown(self PeerStatus, peers []PeerStatus, lastCrown string, observedCrowns []string) string {
+	target := lastCrown
+	if target == "" {
+		target = mostFrequentCrown(observedCrowns)
+	}
+	if target != "" {
+		if target == self.Name && self.Score > 0 {
+			return self.Name
+		}
+		for _, p := range peers {
+			if p.Name == target && p.Online && p.Score > 0 {
+				return target
+			}
+		}
+	}
+
 	eligible := []PeerStatus{self}
 	for _, p := range peers {
 		if p.Online {
@@ -496,6 +523,35 @@ func electCrown(self PeerStatus, peers []PeerStatus) string {
 		return eligible[i].Name < eligible[j].Name
 	})
 	return eligible[0].Name
+}
+
+// mostFrequentCrown returns the crown name that appears most often
+// across a slice of observations. Ties broken by lex order so the
+// result is deterministic. Empty strings are ignored. Returns "" when
+// the input is empty or contains only empty strings.
+func mostFrequentCrown(observed []string) string {
+	if len(observed) == 0 {
+		return ""
+	}
+	counts := make(map[string]int)
+	for _, c := range observed {
+		if c == "" {
+			continue
+		}
+		counts[c]++
+	}
+	if len(counts) == 0 {
+		return ""
+	}
+	best := ""
+	bestCount := 0
+	for name, count := range counts {
+		if count > bestCount || (count == bestCount && name < best) {
+			best = name
+			bestCount = count
+		}
+	}
+	return best
 }
 
 // Prober is the long-running peer-health loop. Runs until ctx is
@@ -540,12 +596,13 @@ func (s *State) probeAll(ctx context.Context) {
 
 	results := make([]PeerStatus, len(peers))
 	discovered := make([][]MeshPeerRecord, len(peers))
+	observedCrowns := make([]string, len(peers))
 	var wg sync.WaitGroup
 	for i := range peers {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
-			results[i], discovered[i] = s.probeOne(ctx, peers[i])
+			results[i], discovered[i], observedCrowns[i] = s.probeOne(ctx, peers[i])
 		}(i)
 	}
 	wg.Wait()
@@ -594,7 +651,8 @@ func (s *State) probeAll(ctx context.Context) {
 	s.mu.Lock()
 	s.self.Score = selfScore
 	s.self.LatencyMs = selfLatencyMs
-	newCrown := electCrown(s.self, applyOfflineDecay(results, s.offlineAt, time.Now()))
+	decayed := applyOfflineDecay(results, s.offlineAt, time.Now())
+	newCrown := electCrown(s.self, decayed, s.lastCrown, observedCrowns)
 	becameCrown := newCrown == s.self.Name && s.lastCrown != "" && s.lastCrown != s.self.Name
 	s.lastCrown = newCrown
 	cb := s.OnBecameCrown
@@ -633,12 +691,31 @@ var probeClient = &http.Client{
 }
 
 // probeOne fetches /mesh/info from p and updates its status. Returns a
-// new PeerStatus keeping the static Name/URL. Score is derived locally
-// from round-trip latency so a peer that lies about its own self-score
-// cannot win the election by inflating it. The second return value is
-// the set of peers the sibling reports in its own snapshot (including
-// its self), used by probeAll for gossip discovery of new members.
-func (s *State) probeOne(ctx context.Context, p PeerStatus) (PeerStatus, []MeshPeerRecord) {
+// new PeerStatus keeping the static Name/URL.
+//
+// Score is taken from the peer's own self-report (snap.Self.Score), not
+// derived locally from round-trip latency. This is load-bearing for
+// crown-election symmetry: every node sees the same Score for every
+// other node, so all nodes elect the same crown deterministically. A
+// locally-derived RTT score makes self.Score (always ~1.0 because the
+// local DB ping is fast) artificially beat peer scores (always <1.0
+// due to network latency), so every node crowns itself — the
+// split-brain documented in I-01.
+//
+// Trust model: peer self-reports are accepted as truth because every
+// sibling already shares cluster_secret (proved by HMAC on /mesh/info
+// requests). A "lying" sibling that inflates its own score still has
+// to be online and signed by the cluster — at which point the operator
+// has bigger problems than a crown election.
+//
+// Returns:
+//   - PeerStatus: refreshed entry to merge into the local view.
+//   - []MeshPeerRecord: peers the sibling reports in its own snapshot
+//     (its self plus its peer view) — used for gossip discovery.
+//   - string: the crown name the sibling currently elected, used to
+//     seed lastCrown on cold start when this instance has no opinion
+//     yet.
+func (s *State) probeOne(ctx context.Context, p PeerStatus) (PeerStatus, []MeshPeerRecord, string) {
 	out := PeerStatus{Name: p.Name, URL: p.URL, LastSeen: p.LastSeen, Score: p.Score, LatencyMs: p.LatencyMs}
 
 	s.mu.RLock()
@@ -655,21 +732,21 @@ func (s *State) probeOne(ctx context.Context, p PeerStatus) (PeerStatus, []MeshP
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, infoURL, nil)
 	if err != nil {
-		return out, nil
+		return out, nil, ""
 	}
 	start := time.Now()
 	resp, err := probeClient.Do(req)
 	if err != nil {
-		return out, nil
+		return out, nil, ""
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return out, nil
+		return out, nil, ""
 	}
 
 	var snap Snapshot
 	if err := json.NewDecoder(resp.Body).Decode(&snap); err != nil {
-		return out, nil
+		return out, nil, ""
 	}
 	latency := time.Since(start)
 
@@ -677,7 +754,7 @@ func (s *State) probeOne(ctx context.Context, p PeerStatus) (PeerStatus, []MeshP
 	out.LastSeen = time.Now()
 	out.Uptime = snap.Self.Uptime
 	out.LatencyMs = float64(latency.Microseconds()) / 1000.0
-	out.Score = scoreFromLatency(latency, s.latencyAlert)
+	out.Score = snap.Self.Score
 
 	// Carry the sibling's cluster-signed identity through to the
 	// snapshot so clients see it in the MeshSnapshot CapMap and can
@@ -724,7 +801,7 @@ func (s *State) probeOne(ctx context.Context, p PeerStatus) (PeerStatus, []MeshP
 		}
 		discovered = append(discovered, MeshPeerRecord{Name: sp.Name, URL: sp.URL})
 	}
-	return out, discovered
+	return out, discovered, snap.Crown
 }
 
 // MarshalSnapshot returns snap encoded as JSON. Returns nil on
