@@ -85,6 +85,45 @@ func VerifyJoinToken(secret, name, url string, expiry int64, sig string) error {
 	return nil
 }
 
+// infoPayloadForSig is the MAC input for /mesh/info requests. Distinct
+// from the join payload ("info|name|expiry") so a captured join token
+// cannot be replayed as an info query and vice-versa.
+func infoPayloadForSig(name string, expiry int64) string {
+	return "info|" + name + "|" + strconv.FormatInt(expiry, 10)
+}
+
+// MintInfoToken computes the HMAC a sibling must include as the "sig"
+// query param on GET /mesh/info. Name identifies the caller (its own
+// cfg.SelfName) so the receiver can log who probed; it is not
+// authoritative. Expiry is the unix second beyond which the receiver
+// must reject.
+func MintInfoToken(secret, name string, expiry time.Time) string {
+	mac := hmac.New(sha256.New, []byte(secret))
+	mac.Write([]byte(infoPayloadForSig(name, expiry.Unix())))
+	return hex.EncodeToString(mac.Sum(nil))
+}
+
+// VerifyInfoToken recomputes the MAC over (name, expiry) and compares
+// in constant time. Returns nil on success.
+func VerifyInfoToken(secret, name string, expiry int64, sig string) error {
+	if secret == "" {
+		return errors.New("cluster secret not configured")
+	}
+	if time.Now().Unix() >= expiry {
+		return errors.New("info token expired")
+	}
+	want, err := hex.DecodeString(sig)
+	if err != nil {
+		return fmt.Errorf("bad signature encoding: %w", err)
+	}
+	mac := hmac.New(sha256.New, []byte(secret))
+	mac.Write([]byte(infoPayloadForSig(name, expiry)))
+	if !hmac.Equal(mac.Sum(nil), want) {
+		return errors.New("signature mismatch")
+	}
+	return nil
+}
+
 // JoinHandler returns the POST /mesh/join handler. Verifies the signed
 // payload with s.ClusterSecret() and adds the caller to the peer list.
 // Returns 404 when the subsystem is disabled (no secret configured) so
@@ -98,6 +137,17 @@ func JoinHandler(s *State) http.Handler {
 		secret := s.ClusterSecret()
 		if secret == "" {
 			http.NotFound(w, r)
+			return
+		}
+		// Rate-limit by source IP before any body read / HMAC check.
+		// An attacker holding no secret can still spray signed-looking
+		// bodies at us; the bucket bounds both the CPU cost of
+		// verifying them and the log volume per source.
+		if !defaultJoinLimiter.allow(clientIP(r)) {
+			log.Warn().Str("remote", r.RemoteAddr).
+				Msg("mesh: /mesh/join rate-limited")
+			w.Header().Set("Retry-After", "10")
+			http.Error(w, "too many requests", http.StatusTooManyRequests)
 			return
 		}
 		body, err := io.ReadAll(io.LimitReader(r.Body, 4096))

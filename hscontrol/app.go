@@ -147,6 +147,25 @@ func NewHeadscale(cfg *types.Config) (*Headscale, error) {
 		Mesh:              mesh.New(cfg.Mesh),
 	}
 
+	// Derive the cluster identity from the shared secret + this
+	// instance's noise pubkey. Done here (not inside mesh.New) because
+	// the noise key is owned by the app, not the mesh package. With no
+	// cluster secret configured this is a no-op — single-server
+	// installs never expose /mesh/identity or publish signatures.
+	if app.Mesh != nil && cfg.Mesh.ClusterSecret != "" {
+		noisePub := noisePrivateKey.Public()
+		noisePubBytes := noisePub.UntypedBytes()
+		id, err := mesh.DeriveIdentity(cfg.Mesh.ClusterSecret, noisePubBytes)
+		if err != nil {
+			return nil, fmt.Errorf("derive cluster identity: %w", err)
+		}
+		app.Mesh.SetIdentity(id)
+		log.Info().
+			Str("self", cfg.Mesh.SelfName).
+			Str("verifier", id.Verifier()).
+			Msg("mesh: cluster identity derived — print this verifier to users on first contact")
+	}
+
 	// Expose the mesh snapshot to the mapper via Config so TailNode
 	// can publish it into each client's CapMap without an import cycle.
 	if app.Mesh != nil {
@@ -552,6 +571,7 @@ func (h *Headscale) createRouter(grpcMux *grpcRuntime.ServeMux) *chi.Mux {
 	r.Get("/key", h.KeyHandler)
 	r.Method(http.MethodGet, "/mesh/info", mesh.Handler(h.Mesh))
 	r.Method(http.MethodPost, "/mesh/join", mesh.JoinHandler(h.Mesh))
+	r.Method(http.MethodGet, "/mesh/identity", mesh.IdentityHandler(h.Mesh))
 	r.Get("/register/{auth_id}", h.authProvider.RegisterHandler)
 	r.Get("/auth/{auth_id}", h.authProvider.AuthHandler)
 
@@ -1109,6 +1129,14 @@ func (h *Headscale) getTLSSettings() (*tls.Config, error) {
 
 		return tlsConfig, err
 	}
+}
+
+// ReadOrCreatePrivateKey loads the noise protocol private key at path
+// or creates a new one and persists it. Exported so the CLI
+// (headscale mesh verifier) can derive the cluster identity without
+// booting the full server.
+func ReadOrCreatePrivateKey(path string) (*key.MachinePrivate, error) {
+	return readOrCreatePrivateKey(path)
 }
 
 func readOrCreatePrivateKey(path string) (*key.MachinePrivate, error) {

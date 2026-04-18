@@ -20,12 +20,16 @@ package mesh
 
 import (
 	"context"
+	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"math"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"sync"
 	"time"
 
@@ -48,6 +52,17 @@ type PeerStatus struct {
 	// Reported for observability; the election uses Score, which is
 	// derived from this value via [scoreFromLatency].
 	LatencyMs float64 `json:"latency_ms,omitempty"`
+
+	// NoisePubHex is this peer's noise protocol pubkey (hex-encoded).
+	// Set for self at State construction time and for siblings from
+	// the identity record observed during probes. Empty when the
+	// cluster shared secret isn't configured.
+	NoisePubHex string `json:"noise_pub,omitempty"`
+
+	// ClusterSigHex is ed25519.Sign(cluster_priv, NoisePub). Set in
+	// tandem with NoisePubHex. The client uses it to verify a sibling
+	// belongs to the pinned cluster before rotating ControlURL to it.
+	ClusterSigHex string `json:"cluster_sig,omitempty"`
 }
 
 // Snapshot is the full mesh view computed locally and published to
@@ -95,6 +110,12 @@ type State struct {
 	// clusterSecret is the HMAC key used to verify /mesh/join requests.
 	// Empty → join endpoint is disabled.
 	clusterSecret string
+
+	// identity is the cluster-signing identity derived from
+	// clusterSecret plus this instance's noise pubkey. Nil until the
+	// app calls [State.SetIdentity] at startup; remains nil when no
+	// cluster secret is configured.
+	identity *Identity
 }
 
 // New constructs a State seeded from cfg. Returns nil if the mesh
@@ -192,6 +213,33 @@ func (s *State) ClusterSecret() string {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return s.clusterSecret
+}
+
+// SetIdentity installs the cluster identity for this instance. Called
+// once at app startup after the noise pubkey has been loaded. Also
+// imprints the NoisePubHex / ClusterSigHex fields on the self entry
+// so every subsequent Snapshot() carries them without the caller
+// having to rebuild the struct.
+func (s *State) SetIdentity(id *Identity) {
+	if s == nil || id == nil {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.identity = id
+	s.self.NoisePubHex = hex.EncodeToString(id.NoisePub)
+	s.self.ClusterSigHex = hex.EncodeToString(id.NoiseSig)
+}
+
+// Identity returns the installed cluster identity, or nil if none has
+// been set. Caller must not mutate the returned pointer.
+func (s *State) Identity() *Identity {
+	if s == nil {
+		return nil
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.identity
 }
 
 type persistedPeers struct {
@@ -449,7 +497,19 @@ var probeClient = &http.Client{
 func (s *State) probeOne(ctx context.Context, p PeerStatus) (PeerStatus, []MeshPeerRecord) {
 	out := PeerStatus{Name: p.Name, URL: p.URL, LastSeen: p.LastSeen, Score: p.Score, LatencyMs: p.LatencyMs}
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, p.URL+"/mesh/info", nil)
+	s.mu.RLock()
+	selfName := s.self.Name
+	secret := s.clusterSecret
+	s.mu.RUnlock()
+
+	infoURL := p.URL + "/mesh/info"
+	if secret != "" {
+		expiry := time.Now().Add(2 * time.Minute)
+		sig := MintInfoToken(secret, selfName, expiry)
+		infoURL = fmt.Sprintf("%s?name=%s&expiry=%d&sig=%s",
+			infoURL, url.QueryEscape(selfName), expiry.Unix(), sig)
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, infoURL, nil)
 	if err != nil {
 		return out, nil
 	}
@@ -474,6 +534,15 @@ func (s *State) probeOne(ctx context.Context, p PeerStatus) (PeerStatus, []MeshP
 	out.Uptime = snap.Self.Uptime
 	out.LatencyMs = float64(latency.Microseconds()) / 1000.0
 	out.Score = scoreFromLatency(latency, s.latencyAlert)
+
+	// Carry the sibling's cluster-signed identity through to the
+	// snapshot so clients see it in the MeshSnapshot CapMap and can
+	// validate it against their pinned cluster pubkey before rotating.
+	// A sibling that omits these fields (different binary? mesh
+	// subsystem misconfigured?) is still probed for liveness — but
+	// clients will refuse to rotate to it.
+	out.NoisePubHex = snap.Self.NoisePubHex
+	out.ClusterSigHex = snap.Self.ClusterSigHex
 
 	// The sibling's self entry is the primary gossip signal: if it's a
 	// peer we don't yet know about, probeAll will add it. We also
@@ -506,6 +575,13 @@ func MarshalSnapshot(snap Snapshot) []byte {
 // Handler returns the http.Handler serving GET /mesh/info. Returns an
 // empty snapshot (200 OK) when the mesh subsystem is disabled so
 // probes from misconfigured siblings don't hammer with 404s.
+//
+// When a cluster_secret is configured, the handler requires an HMAC
+// signature in the query (name, expiry, sig) — an unauthenticated
+// request gets a 403 with no snapshot bytes. This keeps topology,
+// peer URLs, and crown state out of the hands of unsigned callers,
+// who would otherwise use /mesh/info as free reconnaissance for a
+// MITM attempt on bootstrap.
 func Handler(s *State) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
@@ -517,7 +593,52 @@ func Handler(s *State) http.Handler {
 			_ = json.NewEncoder(w).Encode(Snapshot{})
 			return
 		}
+		if secret := s.ClusterSecret(); secret != "" {
+			q := r.URL.Query()
+			name := q.Get("name")
+			sig := q.Get("sig")
+			expiry, err := strconv.ParseInt(q.Get("expiry"), 10, 64)
+			if err != nil || sig == "" {
+				log.Warn().Str("remote", r.RemoteAddr).
+					Msg("mesh: /mesh/info rejected — missing or malformed auth params")
+				http.Error(w, "forbidden", http.StatusForbidden)
+				return
+			}
+			if err := VerifyInfoToken(secret, name, expiry, sig); err != nil {
+				log.Warn().Err(err).Str("remote", r.RemoteAddr).Str("name", name).
+					Msg("mesh: /mesh/info rejected")
+				http.Error(w, "forbidden", http.StatusForbidden)
+				return
+			}
+		}
 		_ = json.NewEncoder(w).Encode(s.Snapshot())
+	})
+}
+
+// IdentityHandler returns the GET /mesh/identity handler. Unauthenticated
+// by design: the response contains only the cluster pubkey, this
+// instance's noise pubkey, and the signature linking them — all of
+// which would anyway be learnable by a passive observer of legitimate
+// traffic. Clients pin the cluster pubkey on first contact and rely on
+// the operator-supplied 8-character verifier to defeat DNS poisoning.
+//
+// Returns 404 when the subsystem is disabled or no cluster identity is
+// installed (single-server setups), so probing scanners get no clue
+// that the endpoint was ever intended to exist.
+func IdentityHandler(s *State) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		id := s.Identity()
+		if id == nil {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Cache-Control", "no-store")
+		_ = json.NewEncoder(w).Encode(id.AsResponse())
 	})
 }
 

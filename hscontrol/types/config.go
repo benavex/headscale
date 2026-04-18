@@ -8,6 +8,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -260,11 +261,29 @@ type AWGConfig struct {
 // headscale should suppress the capability key entirely.
 func (c AWGConfig) IsZero() bool { return c == AWGConfig{} }
 
-// Validate enforces "all-or-nothing": either every field is set
-// (full obfuscation profile) or none are (stock WireGuard). Partial
-// configs would leave some clients unable to handshake with peers
-// using the rest of the profile, so we crash on startup rather than
-// allowing an undetectable wire-format mismatch.
+// AWG parameter bounds. Enforced at config-load so an operator
+// typo can't push wire-format-breaking values, and mirrored on the
+// client (wgcfg.ValidateAWGParams) so a compromised headscale can't
+// do the same via MapResponse.
+//
+// Upper bounds are chosen generously above real-world defaults
+// (AmneziaVPN's reference Jc=3, S1..S4 in 15-23) but well below
+// values that would make the engine behave pathologically: Jmax=1280
+// at Jc=128 would still emit <200KB of junk per handshake which is
+// tolerable; anything higher wastes client CPU without adding
+// unobservability.
+const (
+	awgMaxJc      = 128  // junk packet count per handshake
+	awgMaxJSize   = 1280 // jmin/jmax, upper bound on each junk packet
+	awgMaxPadding = 1280 // s1..s4, padding added to each handshake/transport variant
+)
+
+// Validate enforces "all-or-nothing" (either every field is set
+// or none are — mixed configs would break wire-format compatibility
+// with peers using the rest of the profile) AND that every numeric
+// field is inside a sane range. Partial configs and out-of-range
+// values crash at startup rather than silently producing a
+// misbehaving tunnel.
 func (c AWGConfig) Validate() error {
 	if c.IsZero() {
 		return nil
@@ -286,10 +305,66 @@ func (c AWGConfig) Validate() error {
 	check("h2", c.H2 != "")
 	check("h3", c.H3 != "")
 	check("h4", c.H4 != "")
-	if len(missing) == 0 {
+	if len(missing) != 0 {
+		return fmt.Errorf("awg config is partial; missing %v — set every field or omit the awg block entirely", missing)
+	}
+
+	// Range checks. amneziawg-go UAPI already rejects <=0 for Jc/Jmin/Jmax
+	// and <0 for S1-S4, but accepts unbounded large values; we clamp here.
+	if c.Jc < 1 || c.Jc > awgMaxJc {
+		return fmt.Errorf("awg.jc must be in [1, %d], got %d", awgMaxJc, c.Jc)
+	}
+	if c.Jmin < 1 || c.Jmin > awgMaxJSize {
+		return fmt.Errorf("awg.jmin must be in [1, %d], got %d", awgMaxJSize, c.Jmin)
+	}
+	if c.Jmax < c.Jmin || c.Jmax > awgMaxJSize {
+		return fmt.Errorf("awg.jmax must be in [jmin=%d, %d], got %d", c.Jmin, awgMaxJSize, c.Jmax)
+	}
+	for _, p := range [...]struct {
+		name string
+		val  int
+	}{{"s1", c.S1}, {"s2", c.S2}, {"s3", c.S3}, {"s4", c.S4}} {
+		if p.val < 0 || p.val > awgMaxPadding {
+			return fmt.Errorf("awg.%s must be in [0, %d], got %d", p.name, awgMaxPadding, p.val)
+		}
+	}
+	for _, p := range [...]struct {
+		name, val string
+	}{{"h1", c.H1}, {"h2", c.H2}, {"h3", c.H3}, {"h4", c.H4}} {
+		if err := validateAWGMagicHeader(p.val); err != nil {
+			return fmt.Errorf("awg.%s: %w", p.name, err)
+		}
+	}
+	return nil
+}
+
+// validateAWGMagicHeader parses a magic-header spec as amneziawg-go
+// does ("N" or "N-M" where both are uint32 and M >= N) and returns an
+// error for any malformed input. Kept alongside AWGConfig so the
+// headscale-side validation matches wire semantics exactly.
+func validateAWGMagicHeader(spec string) error {
+	if spec == "" {
+		return fmt.Errorf("empty")
+	}
+	parts := strings.Split(spec, "-")
+	if len(parts) < 1 || len(parts) > 2 {
+		return fmt.Errorf("bad format %q (want N or N-M)", spec)
+	}
+	start, err := strconv.ParseUint(parts[0], 10, 32)
+	if err != nil {
+		return fmt.Errorf("start not uint32: %w", err)
+	}
+	if len(parts) == 1 {
 		return nil
 	}
-	return fmt.Errorf("awg config is partial; missing %v — set every field or omit the awg block entirely", missing)
+	end, err := strconv.ParseUint(parts[1], 10, 32)
+	if err != nil {
+		return fmt.Errorf("end not uint32: %w", err)
+	}
+	if end < start {
+		return fmt.Errorf("end %d < start %d", end, start)
+	}
+	return nil
 }
 
 // CapabilityAmneziaWG is the tailcfg.NodeCapability under which
