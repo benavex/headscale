@@ -260,6 +260,38 @@ type AWGConfig struct {
 // headscale should suppress the capability key entirely.
 func (c AWGConfig) IsZero() bool { return c == AWGConfig{} }
 
+// Validate enforces "all-or-nothing": either every field is set
+// (full obfuscation profile) or none are (stock WireGuard). Partial
+// configs would leave some clients unable to handshake with peers
+// using the rest of the profile, so we crash on startup rather than
+// allowing an undetectable wire-format mismatch.
+func (c AWGConfig) Validate() error {
+	if c.IsZero() {
+		return nil
+	}
+	var missing []string
+	check := func(name string, set bool) {
+		if !set {
+			missing = append(missing, name)
+		}
+	}
+	check("jc", c.Jc != 0)
+	check("jmin", c.Jmin != 0)
+	check("jmax", c.Jmax != 0)
+	check("s1", c.S1 != 0)
+	check("s2", c.S2 != 0)
+	check("s3", c.S3 != 0)
+	check("s4", c.S4 != 0)
+	check("h1", c.H1 != "")
+	check("h2", c.H2 != "")
+	check("h3", c.H3 != "")
+	check("h4", c.H4 != "")
+	if len(missing) == 0 {
+		return nil
+	}
+	return fmt.Errorf("awg config is partial; missing %v — set every field or omit the awg block entirely", missing)
+}
+
 // CapabilityAmneziaWG is the tailcfg.NodeCapability under which
 // headscale publishes AmneziaWG params in each client's SelfNode.CapMap.
 const CapabilityAmneziaWG tailcfg.NodeCapability = "benavex.com/cap/amneziawg"
@@ -738,6 +770,23 @@ func validateServerConfig() error {
 			"Fatal config error: tuning.node_store_batch_timeout must be positive, got %s\n",
 			timeout,
 		)
+	}
+
+	awg := AWGConfig{
+		Jc:   viper.GetInt("awg.jc"),
+		Jmin: viper.GetInt("awg.jmin"),
+		Jmax: viper.GetInt("awg.jmax"),
+		S1:   viper.GetInt("awg.s1"),
+		S2:   viper.GetInt("awg.s2"),
+		S3:   viper.GetInt("awg.s3"),
+		S4:   viper.GetInt("awg.s4"),
+		H1:   viper.GetString("awg.h1"),
+		H2:   viper.GetString("awg.h2"),
+		H3:   viper.GetString("awg.h3"),
+		H4:   viper.GetString("awg.h4"),
+	}
+	if err := awg.Validate(); err != nil {
+		errorText += "Fatal config error: " + err.Error() + "\n"
 	}
 
 	if errorText != "" {
