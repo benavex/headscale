@@ -19,6 +19,7 @@ const (
 	del             = 2
 	update          = 3
 	rebuildPeerMaps = 4
+	reloadAll       = 5
 )
 
 const prometheusNamespace = "headscale"
@@ -146,6 +147,8 @@ type work struct {
 	nodeResult chan types.NodeView // Channel to return the resulting node after batch application
 	// For rebuildPeerMaps operation
 	rebuildResult chan struct{}
+	// For reloadAll operation: the full set of nodes to replace the current map with.
+	replaceNodes map[types.NodeID]types.Node
 }
 
 // PutNode adds or updates a node in the store.
@@ -346,6 +349,14 @@ func (s *NodeStore) applyBatch(batch []work) {
 			// rebuildPeerMaps doesn't modify nodes, it just forces the snapshot rebuild
 			// below to recalculate peer relationships using the current peersFunc
 			rebuildOps = append(rebuildOps, w)
+		case reloadAll:
+			// Wholesale replace the in-memory map with what the DB tick fetched.
+			// Subsequent put/update/del ops in this same batch overlay on top
+			// (they queued after the reload), so in-flight local writes are
+			// preserved. persistNodeToDB always commits to DB BEFORE the
+			// matching NodeStore op queues, so the reload's snapshot already
+			// includes those committed local writes.
+			nodes = w.replaceNodes
 		}
 	}
 
@@ -594,6 +605,34 @@ func (s *NodeStore) ListPeers(id types.NodeID) views.Slice[types.NodeView] {
 	nodeStoreOperations.WithLabelValues("list_peers").Inc()
 
 	return views.SliceOf(s.data.Load().peersByNode[id])
+}
+
+// ReloadFromDB replaces the entire NodeStore contents with the given nodes,
+// preserving the snapshot's atomic-swap semantics. Used by the periodic
+// DB-sync ticker so a sibling headscale (sharing the same postgres) picks
+// up nodes registered against another instance. In-flight writes queued
+// AFTER the reload still win because applyBatch processes ops in order.
+func (s *NodeStore) ReloadFromDB(allNodes types.Nodes) {
+	timer := prometheus.NewTimer(nodeStoreOperationDuration.WithLabelValues("reload_all"))
+	defer timer.ObserveDuration()
+
+	nodes := make(map[types.NodeID]types.Node, len(allNodes))
+	for _, n := range allNodes {
+		nodes[n.ID] = *n
+	}
+
+	w := work{
+		op:           reloadAll,
+		replaceNodes: nodes,
+		result:       make(chan struct{}),
+	}
+
+	nodeStoreQueueDepth.Inc()
+	s.writeQueue <- w
+	<-w.result
+	nodeStoreQueueDepth.Dec()
+
+	nodeStoreOperations.WithLabelValues("reload_all").Inc()
 }
 
 // RebuildPeerMaps rebuilds the peer relationship map using the current peersFunc.

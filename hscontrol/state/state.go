@@ -51,6 +51,17 @@ const (
 	// defaultNodeStoreBatchTimeout is the default maximum time to wait before
 	// processing a partial batch of node operations.
 	defaultNodeStoreBatchTimeout = 500 * time.Millisecond
+
+	// nodeStoreDBSyncInterval is how often each headscale instance re-reads
+	// the nodes table and refreshes its in-memory NodeStore. This is what
+	// makes a multi-instance deployment (siblings sharing one postgres) see
+	// nodes registered against another sibling. Picked so failover demos
+	// converge well within the 60s control-failure threshold.
+	//
+	// Cost is one SELECT * FROM nodes per tick, on the order of microseconds
+	// for any realistic node count, so we don't gate on whether siblings are
+	// configured — single-instance deployments just no-op.
+	nodeStoreDBSyncInterval = 5 * time.Second
 )
 
 // ErrUnsupportedPolicyMode is returned for invalid policy modes. Valid modes are "file" and "db".
@@ -167,6 +178,10 @@ type State struct {
 	// Ref: https://github.com/tailscale/tailscale/issues/7125
 	sshCheckAuth map[sshCheckPair]time.Time
 	sshCheckMu   sync.RWMutex
+
+	// dbSyncDone signals the periodic NodeStore-from-DB reloader to exit.
+	// Closed by Close(); the goroutine selects on it alongside its ticker.
+	dbSyncDone chan struct{}
 }
 
 // NewState creates and initializes a new State instance, setting up the database,
@@ -250,7 +265,7 @@ func NewState(cfg *types.Config) (*State, error) {
 	)
 	nodeStore.Start()
 
-	return &State{
+	s := &State{
 		cfg: cfg,
 
 		db:            db,
@@ -262,11 +277,37 @@ func NewState(cfg *types.Config) (*State, error) {
 		pings:         newPingTracker(),
 
 		sshCheckAuth: make(map[sshCheckPair]time.Time),
-	}, nil
+		dbSyncDone:   make(chan struct{}),
+	}
+	go s.runNodeStoreDBSync()
+
+	return s, nil
+}
+
+// runNodeStoreDBSync periodically re-reads the nodes table and refreshes
+// the NodeStore so a sibling headscale (sharing the same postgres) sees
+// nodes registered against another instance. Exits when dbSyncDone is closed.
+func (s *State) runNodeStoreDBSync() {
+	t := time.NewTicker(nodeStoreDBSyncInterval)
+	defer t.Stop()
+	for {
+		select {
+		case <-s.dbSyncDone:
+			return
+		case <-t.C:
+			nodes, err := s.db.ListNodes()
+			if err != nil {
+				log.Warn().Err(err).Msg("nodestore db-sync: ListNodes failed; will retry next tick")
+				continue
+			}
+			s.nodeStore.ReloadFromDB(nodes)
+		}
+	}
 }
 
 // Close gracefully shuts down the State instance and releases all resources.
 func (s *State) Close() error {
+	close(s.dbSyncDone)
 	s.nodeStore.Stop()
 
 	err := s.db.Close()
