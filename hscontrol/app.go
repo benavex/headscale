@@ -224,6 +224,10 @@ func NewHeadscale(cfg *types.Config) (*Headscale, error) {
 				}
 				cancel()
 			}
+			if cfg.Mesh.SkipCrownExit {
+				log.Warn().Msg("mesh: became crown; skip_crown_exit set, staying up (NodeStore drift sync handles rehydrate)")
+				return
+			}
 			log.Warn().Msg("mesh: became crown; exiting to rehydrate state from DB")
 			os.Exit(0)
 		}

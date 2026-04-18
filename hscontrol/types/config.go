@@ -457,6 +457,17 @@ type MeshConfig struct {
 	// previously-pinned exit). Each headscale sets its own value;
 	// siblings learn it through probes.
 	ExitNodeName string `mapstructure:"exit_node_name"`
+
+	// SkipCrownExit, when true, suppresses the os.Exit(0) at the end
+	// of the crown-self-transition handler. The exit was originally
+	// there to force a NodeStore rehydrate from the shared DB —
+	// obsolete now that state.runNodeStoreDBSync re-reads on a 5s
+	// tick — and is only useful when running under docker (which
+	// restarts on exit). Bare deployments (test rigs, systemd-without-
+	// Restart=always) crash-loop without this. Default false preserves
+	// the docker-friendly historical behaviour. The DDNS update and
+	// RunPromote logic still runs; only the os.Exit is skipped.
+	SkipCrownExit bool `mapstructure:"skip_crown_exit"`
 }
 
 // MeshPeerConfig identifies a sibling headscale instance.
@@ -991,6 +1002,7 @@ func meshConfigFromViper(serverURL string) MeshConfig {
 		PeersStatePath: viper.GetString("mesh.peers_state_path"),
 		DDNSUpdateURL:  viper.GetString("mesh.ddns_update_url"),
 		ExitNodeName:   viper.GetString("mesh.exit_node_name"),
+		SkipCrownExit:  viper.GetBool("mesh.skip_crown_exit"),
 	}
 	if mc.SelfURL == "" {
 		mc.SelfURL = serverURL
