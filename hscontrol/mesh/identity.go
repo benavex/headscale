@@ -37,6 +37,7 @@ import (
 	"fmt"
 	"io"
 	"math/big"
+	"net"
 	"time"
 
 	"golang.org/x/crypto/hkdf"
@@ -177,6 +178,12 @@ func DeriveTLSCert(secret string) (tls.Certificate, string, error) {
 	notBefore := time.Date(2020, 1, 1, 0, 0, 0, 0, time.UTC)
 	notAfter := time.Date(2120, 1, 1, 0, 0, 0, 0, time.UTC)
 
+	// 127.0.0.1 / ::1 IP SANs let siblings + local exit-node tailscaleds
+	// dial https://127.0.0.1:<port> on the same host and pass stock Go
+	// hostname verification (tailscale's tlsdial runs x509.Verify with
+	// DNSName=dialedHost). Only loopback — no host-specific info — so
+	// the derivation stays deterministic across the cluster and the
+	// SPKI-pin invariant holds.
 	tmpl := &x509.Certificate{
 		SerialNumber: big.NewInt(1),
 		Subject: pkix.Name{
@@ -189,6 +196,7 @@ func DeriveTLSCert(secret string) (tls.Certificate, string, error) {
 		BasicConstraintsValid: true,
 		IsCA:                  true,
 		DNSNames:              []string{"headscale-cluster.local"},
+		IPAddresses:           []net.IP{net.IPv4(127, 0, 0, 1), net.IPv6loopback},
 	}
 
 	derBytes, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, pub, priv)

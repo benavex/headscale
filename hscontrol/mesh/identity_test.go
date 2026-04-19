@@ -7,6 +7,7 @@ import (
 	"bytes"
 	"crypto/ed25519"
 	"encoding/hex"
+	"net"
 	"strings"
 	"testing"
 )
@@ -175,6 +176,33 @@ func TestDeriveTLSCertDifferentSecret(t *testing.T) {
 func TestDeriveTLSCertEmpty(t *testing.T) {
 	if _, _, err := DeriveTLSCert(""); err == nil {
 		t.Fatal("expected error on empty secret")
+	}
+}
+
+// TestDeriveTLSCertLoopbackSANs: cert carries 127.0.0.1 + ::1 as IP SANs
+// so local ts-awg dials to https://127.0.0.1:<port> pass tailscale's
+// standard x509.Verify hostname check. Without this, exit-node
+// tailscaleds get "x509: cannot validate certificate for 127.0.0.1
+// because it doesn't contain any IP SANs".
+func TestDeriveTLSCertLoopbackSANs(t *testing.T) {
+	cert, _, err := DeriveTLSCert("loopback-sans")
+	if err != nil {
+		t.Fatal(err)
+	}
+	haveV4, haveV6 := false, false
+	for _, ip := range cert.Leaf.IPAddresses {
+		if ip.Equal(net.IPv4(127, 0, 0, 1)) {
+			haveV4 = true
+		}
+		if ip.Equal(net.IPv6loopback) {
+			haveV6 = true
+		}
+	}
+	if !haveV4 {
+		t.Errorf("127.0.0.1 missing from IP SANs: %v", cert.Leaf.IPAddresses)
+	}
+	if !haveV6 {
+		t.Errorf("::1 missing from IP SANs: %v", cert.Leaf.IPAddresses)
 	}
 }
 
