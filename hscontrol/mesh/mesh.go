@@ -139,9 +139,13 @@ type State struct {
 	lastCrown string
 
 	// OnBecameCrown is invoked synchronously whenever this instance
-	// newly wins the crown (i.e. the election output transitions
-	// from some other name to self). Set by the app after New().
-	// In-flight probes do not block on it.
+	// newly wins the crown: either a cluster-wide transition (another
+	// node was crown, now self is) OR a startup-as-crown (lastCrown
+	// is empty and the first election resolves to self). The latter
+	// case matters because the DDNS update hook must fire on first
+	// boot too — otherwise the bootstrap hostname stays stuck on
+	// whatever IP was there before the node came up. Set by the app
+	// after New(). In-flight probes do not block on it.
 	OnBecameCrown func()
 
 	// SelfHealthProbe, if set, is called each probe cycle to measure
@@ -779,7 +783,14 @@ func (s *State) probeAll(ctx context.Context) {
 	s.self.ReliabilityStats = selfStats
 	decayed := applyOfflineDecay(results, s.offlineAt, time.Now())
 	newCrown := electCrown(s.self, decayed, s.lastCrown, observedCrowns)
-	becameCrown := newCrown == s.self.Name && s.lastCrown != "" && s.lastCrown != s.self.Name
+	// Fire OnBecameCrown whenever this instance is the crown and we
+	// were not the crown on the previous tick. Importantly, the empty
+	// `s.lastCrown == ""` case (first probe after boot) counts — a
+	// node that boots already-crown still needs its DDNS hook fired
+	// so the bootstrap hostname resolves to it immediately, rather
+	// than staying stuck on whatever IP was there pre-reboot until a
+	// real transition happens.
+	becameCrown := newCrown == s.self.Name && s.lastCrown != s.self.Name
 	s.lastCrown = newCrown
 	cb := s.OnBecameCrown
 	s.peers = results
