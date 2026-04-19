@@ -789,6 +789,14 @@ WHERE tags IS NOT NULL AND tags != '[]' AND tags != '';
 			}
 		}
 
+		// InitSchema is the fresh-DB fast path and skips every
+		// individual migration, so the 202604191200-peer-stats
+		// migration never runs on a new database. Create the
+		// peer-stats tables here so schema.sql validation matches.
+		if err := createPeerStatsTables(tx); err != nil {
+			return err
+		}
+
 		return nil
 	})
 
