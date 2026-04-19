@@ -20,8 +20,12 @@ package mesh
 
 import (
 	"context"
+	"crypto/sha256"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"math"
 	"net/http"
@@ -305,8 +309,11 @@ func (s *State) Identity() *Identity {
 }
 
 // SetTLSSPKI records the hex SHA-256 of the cluster-derived TLS cert's
-// SubjectPublicKeyInfo so /mesh/identity can publish it. Pass "" to
-// clear (used when the server is running with its own CA-issued cert).
+// SubjectPublicKeyInfo so /mesh/identity can publish it, and wires the
+// same pin into probeClient so inter-peer /mesh/info and /mesh/join
+// calls succeed against HTTPS siblings whose cert is self-signed off
+// the same cluster secret. Pass "" to clear both (single-server
+// deployments or servers using a CA-issued cert).
 func (s *State) SetTLSSPKI(spki string) {
 	if s == nil {
 		return
@@ -314,6 +321,7 @@ func (s *State) SetTLSSPKI(spki string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.tlsSPKI = spki
+	installProbeSPKIPin(spki)
 }
 
 // TLSSPKI returns the SPKI hash set by [State.SetTLSSPKI], or "".
@@ -802,10 +810,47 @@ func applyOfflineDecay(peers []PeerStatus, offlineAt time.Duration, now time.Tim
 	return out
 }
 
+// probeTransport backs probeClient. Started as a clone of the default
+// transport; [State.SetTLSSPKI] swaps in a TLSClientConfig that pins
+// peers' certs by SPKI hash so HTTPS /mesh/info and /mesh/join work
+// against the deterministically-derived cluster cert without needing
+// a CA chain or hostname match.
+var probeTransport = http.DefaultTransport.(*http.Transport).Clone()
+
 // probeClient is a module-level HTTP client with tight timeouts so a
 // dead peer doesn't stall the probe cycle.
 var probeClient = &http.Client{
-	Timeout: 5 * time.Second,
+	Timeout:   5 * time.Second,
+	Transport: probeTransport,
+}
+
+// installProbeSPKIPin rewires probeClient to verify every TLS peer's
+// SPKI against expectedHex (hex SHA-256 of the peer cert's DER SPKI).
+// Chain + hostname checks are skipped because the cluster cert is
+// self-signed with a fixed placeholder SAN — trust comes from the
+// pin. Passing "" removes the pin (falls back to the OS CA bundle).
+func installProbeSPKIPin(expectedHex string) {
+	if expectedHex == "" {
+		probeTransport.TLSClientConfig = nil
+		return
+	}
+	probeTransport.TLSClientConfig = &tls.Config{
+		InsecureSkipVerify: true, //nolint:gosec // cluster pin replaces chain check
+		VerifyPeerCertificate: func(rawCerts [][]byte, _ [][]*x509.Certificate) error {
+			if len(rawCerts) == 0 {
+				return errors.New("peer presented no certificates")
+			}
+			cert, err := x509.ParseCertificate(rawCerts[0])
+			if err != nil {
+				return fmt.Errorf("parse peer cert: %w", err)
+			}
+			sum := sha256.Sum256(cert.RawSubjectPublicKeyInfo)
+			if got := hex.EncodeToString(sum[:]); got != expectedHex {
+				return fmt.Errorf("peer cert SPKI %s != cluster pin %s", got, expectedHex)
+			}
+			return nil
+		},
+	}
 }
 
 // probeOne fetches /mesh/info from p and updates its status. Returns a
