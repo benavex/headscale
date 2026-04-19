@@ -112,3 +112,32 @@ CREATE TABLE database_versions(
   version text NOT NULL,
   updated_at datetime
 );
+
+-- Mesh peer reliability: one row per (peer_name, hour_bucket). Written
+-- by the mesh prober every probe cycle. Never deleted (retention-free;
+-- see todo.md §11 "Storage cost"). Used for uptime %, disconnect
+-- counts, and latency min/max aggregates.
+CREATE TABLE peer_reliability(
+  id integer PRIMARY KEY AUTOINCREMENT,
+  peer_name text NOT NULL,
+  hour_bucket datetime NOT NULL,
+  probe_success integer NOT NULL DEFAULT 0,
+  probe_total integer NOT NULL DEFAULT 0,
+  sum_latency_us integer NOT NULL DEFAULT 0,
+  min_latency_us integer NOT NULL DEFAULT 0,
+  max_latency_us integer NOT NULL DEFAULT 0,
+  disconnect_count integer NOT NULL DEFAULT 0
+);
+CREATE UNIQUE INDEX idx_peer_reliability_bucket ON peer_reliability(peer_name, hour_bucket);
+CREATE INDEX idx_peer_reliability_peer_name_hour ON peer_reliability(peer_name, hour_bucket DESC);
+
+-- Mesh peer throughput: one row per probe sample, opt-in via
+-- mesh.throughput_probe. Never deleted.
+CREATE TABLE peer_throughput(
+  id integer PRIMARY KEY AUTOINCREMENT,
+  peer_name text NOT NULL,
+  ts datetime NOT NULL,
+  observed_mbps real NOT NULL DEFAULT 0,
+  bytes_measured integer NOT NULL DEFAULT 0
+);
+CREATE INDEX idx_peer_throughput_peer_name_ts ON peer_throughput(peer_name, ts DESC);

@@ -476,6 +476,26 @@ type MeshConfig struct {
 	// the docker-friendly historical behaviour. The DDNS update and
 	// RunPromote logic still runs; only the os.Exit is skipped.
 	SkipCrownExit bool `mapstructure:"skip_crown_exit"`
+
+	// ThroughputProbe, when true, starts a background ticker that
+	// periodically GETs ThroughputProbeURL, times the download, and
+	// writes one row per sample to the peer_throughput table. Off by
+	// default: this is active bandwidth use against an external server
+	// and operators of metered links won't want it. See §11 for the
+	// full design.
+	ThroughputProbe bool `mapstructure:"throughput_probe"`
+
+	// ThroughputProbeURL is the URL fetched by the throughput probe.
+	// Must serve a fixed-size payload over HTTPS. Defaults to
+	// https://cachefly.cachefly.net/1mb.test — a 1 MiB file on
+	// Cachefly's free anycast CDN, usually the nearest PoP wins so the
+	// measurement reflects the instance's upstream bandwidth rather
+	// than any specific long-haul route.
+	ThroughputProbeURL string `mapstructure:"throughput_probe_url"`
+
+	// ThroughputProbeInterval is how often the throughput ticker
+	// runs. Defaults to 5 min.
+	ThroughputProbeInterval time.Duration `mapstructure:"throughput_probe_interval"`
 }
 
 // MeshPeerConfig identifies a sibling headscale instance.
@@ -999,18 +1019,27 @@ func logtailConfig() LogTailConfig {
 // SelfURL so operators don't have to repeat themselves.
 func meshConfigFromViper(serverURL string) MeshConfig {
 	mc := MeshConfig{
-		SelfName:       viper.GetString("mesh.self_name"),
-		SelfURL:        viper.GetString("mesh.self_url"),
-		ProbeInterval:  viper.GetDuration("mesh.probe_interval"),
-		OfflineAfter:   viper.GetDuration("mesh.offline_after"),
-		LatencyAlert:   viper.GetDuration("mesh.latency_alert"),
-		LocalDBHost:    viper.GetString("mesh.local_db_host"),
-		ClusterSecret:  viper.GetString("mesh.cluster_secret"),
-		BootstrapURL:   viper.GetString("mesh.bootstrap_url"),
-		PeersStatePath: viper.GetString("mesh.peers_state_path"),
-		DDNSUpdateURL:  viper.GetString("mesh.ddns_update_url"),
-		ExitNodeName:   viper.GetString("mesh.exit_node_name"),
-		SkipCrownExit:  viper.GetBool("mesh.skip_crown_exit"),
+		SelfName:                viper.GetString("mesh.self_name"),
+		SelfURL:                 viper.GetString("mesh.self_url"),
+		ProbeInterval:           viper.GetDuration("mesh.probe_interval"),
+		OfflineAfter:            viper.GetDuration("mesh.offline_after"),
+		LatencyAlert:            viper.GetDuration("mesh.latency_alert"),
+		LocalDBHost:             viper.GetString("mesh.local_db_host"),
+		ClusterSecret:           viper.GetString("mesh.cluster_secret"),
+		BootstrapURL:            viper.GetString("mesh.bootstrap_url"),
+		PeersStatePath:          viper.GetString("mesh.peers_state_path"),
+		DDNSUpdateURL:           viper.GetString("mesh.ddns_update_url"),
+		ExitNodeName:            viper.GetString("mesh.exit_node_name"),
+		SkipCrownExit:           viper.GetBool("mesh.skip_crown_exit"),
+		ThroughputProbe:         viper.GetBool("mesh.throughput_probe"),
+		ThroughputProbeURL:      viper.GetString("mesh.throughput_probe_url"),
+		ThroughputProbeInterval: viper.GetDuration("mesh.throughput_probe_interval"),
+	}
+	if mc.ThroughputProbeURL == "" {
+		mc.ThroughputProbeURL = "https://cachefly.cachefly.net/1mb.test"
+	}
+	if mc.ThroughputProbeInterval <= 0 {
+		mc.ThroughputProbeInterval = 5 * time.Minute
 	}
 	if mc.SelfURL == "" {
 		mc.SelfURL = serverURL

@@ -95,6 +95,13 @@ type PeerStatus struct {
 	// with this hostname and pin egress to it whenever this peer is
 	// the elected crown.
 	ExitNodeName string `json:"exit_node_name,omitempty"`
+
+	// ReliabilityStats is the compact rollup of this peer's historical
+	// uptime / disconnect / latency / throughput aggregates. Populated
+	// for peers with at least one probe sample recorded; zero-valued
+	// otherwise (new peers, or instances without a DB-backed
+	// recorder). See reliability.go for the computation pipeline.
+	ReliabilityStats ReliabilityStats `json:"reliability,omitempty"`
 }
 
 // Snapshot is the full mesh view computed locally and published to
@@ -154,6 +161,16 @@ type State struct {
 	// app calls [State.SetIdentity] at startup; remains nil when no
 	// cluster secret is configured.
 	identity *Identity
+
+	// recorder persists probe outcomes and throughput samples to the
+	// peer_reliability / peer_throughput tables. Nil for mesh-only
+	// test rigs; RecordProbe / ComputeStats are no-ops when unset.
+	recorder Recorder
+
+	// statsCache holds recently-computed ReliabilityStats per peer
+	// name so repeat lookups inside a probe cycle don't re-query the
+	// DB. Entries older than statsTTL are refreshed on access.
+	statsCache map[string]cachedStats
 }
 
 // New constructs a State seeded from cfg. Returns nil if the mesh
@@ -517,12 +534,37 @@ func electCrown(self PeerStatus, peers []PeerStatus, lastCrown string, observedC
 		}
 	}
 	sort.Slice(eligible, func(i, j int) bool {
-		if eligible[i].Score != eligible[j].Score {
-			return eligible[i].Score > eligible[j].Score
+		wi := weightedScore(eligible[i])
+		wj := weightedScore(eligible[j])
+		if wi != wj {
+			return wi > wj
 		}
 		return eligible[i].Name < eligible[j].Name
 	})
 	return eligible[0].Name
+}
+
+// weightedScore multiplies Score by a 7-day uptime weight so a
+// historically-reliable peer outranks a merely-fast-right-now one.
+// Floor the weight at 0.01 so a brand-new peer with zero history (its
+// Uptime7d reads as 0) still gets a non-zero score — its lifetime and
+// 24 h are also zero so it's effectively treated as 100% (see below),
+// matching the "new peers win by default" rule from §11. A peer with
+// zero probe_total across every window is treated as 100% uptime:
+// it's cold-start, not a failure. Only a peer with probe_total>0 and
+// low success rate is demoted.
+func weightedScore(p PeerStatus) float64 {
+	stats := p.ReliabilityStats
+	// Absence of history — all windows zero — is indistinguishable
+	// from "cold start". Treat as 100%: no penalty.
+	if stats.Uptime7d == 0 && stats.Uptime24h == 0 && stats.UptimeLife == 0 {
+		return p.Score
+	}
+	w := stats.Uptime7d / 100.0
+	if w < 0.01 {
+		w = 0.01
+	}
+	return p.Score * w
 }
 
 // mostFrequentCrown returns the crown name that appears most often
@@ -648,9 +690,58 @@ func (s *State) probeAll(ctx context.Context) {
 		}
 	}
 
+	// Capture prior online state per peer URL before we swap results
+	// into s.peers, so RecordProbe can see the was→now transition and
+	// increment disconnect_count on true→false.
+	s.mu.RLock()
+	priorOnline := make(map[string]bool, len(s.peers))
+	for _, p := range s.peers {
+		priorOnline[p.URL] = p.Online
+	}
+	s.mu.RUnlock()
+
+	// Persist each peer's probe outcome into peer_reliability. Done
+	// before taking s.mu to avoid holding the state lock across a DB
+	// write. RecordProbe no-ops when no recorder is configured.
+	now := time.Now()
+	for _, r := range results {
+		if r.Name == "" {
+			continue
+		}
+		var latency time.Duration
+		if r.LatencyMs > 0 {
+			latency = time.Duration(r.LatencyMs * float64(time.Millisecond))
+		}
+		s.RecordProbe(r.Name, now, r.Online, latency, priorOnline[r.URL], r.Online)
+	}
+	// Also record a row for self so uptime_pct can be computed for
+	// the self entry when viewed from another instance via history
+	// queries. Self probe "succeeds" whenever selfScore > 0.
+	if selfName != "" {
+		var selfLatency time.Duration
+		if selfLatencyMs > 0 {
+			selfLatency = time.Duration(selfLatencyMs * float64(time.Millisecond))
+		}
+		s.RecordProbe(selfName, now, selfScore > 0, selfLatency, true, selfScore > 0)
+	}
+
+	// Attach historical-reliability rollups to each peer status and to
+	// self before electCrown runs. ComputeStats is cached (statsTTL)
+	// so repeat calls in the same probe cycle don't hammer the DB.
+	for i := range results {
+		if results[i].Name != "" {
+			results[i].ReliabilityStats = s.ComputeStats(results[i].Name)
+		}
+	}
+	selfStats := ReliabilityStats{}
+	if selfName != "" {
+		selfStats = s.ComputeStats(selfName)
+	}
+
 	s.mu.Lock()
 	s.self.Score = selfScore
 	s.self.LatencyMs = selfLatencyMs
+	s.self.ReliabilityStats = selfStats
 	decayed := applyOfflineDecay(results, s.offlineAt, time.Now())
 	newCrown := electCrown(s.self, decayed, s.lastCrown, observedCrowns)
 	becameCrown := newCrown == s.self.Name && s.lastCrown != "" && s.lastCrown != s.self.Name
@@ -728,22 +819,23 @@ func (s *State) probeOne(ctx context.Context, p PeerStatus) (PeerStatus, []MeshP
 	// zero — only the success path below sets them. Online stays false
 	// when the probe fails.
 	out := PeerStatus{
-		Name:           p.Name,
-		URL:            p.URL,
-		LastSeen:       p.LastSeen,
-		Score:          p.Score,
-		LatencyMs:      p.LatencyMs,
-		NoisePubHex:    p.NoisePubHex,
-		ClusterSigHex:  p.ClusterSigHex,
-		ExitNodeName:   p.ExitNodeName,
-		DERPRegionID:   p.DERPRegionID,
-		DERPHost:       p.DERPHost,
-		DERPPort:       p.DERPPort,
-		DERPv4:         p.DERPv4,
-		DERPv6:         p.DERPv6,
-		DERPSTUNPort:   p.DERPSTUNPort,
-		DERPRegionCode: p.DERPRegionCode,
-		DERPRegionName: p.DERPRegionName,
+		Name:             p.Name,
+		URL:              p.URL,
+		LastSeen:         p.LastSeen,
+		Score:            p.Score,
+		LatencyMs:        p.LatencyMs,
+		NoisePubHex:      p.NoisePubHex,
+		ClusterSigHex:    p.ClusterSigHex,
+		ExitNodeName:     p.ExitNodeName,
+		DERPRegionID:     p.DERPRegionID,
+		DERPHost:         p.DERPHost,
+		DERPPort:         p.DERPPort,
+		DERPv4:           p.DERPv4,
+		DERPv6:           p.DERPv6,
+		DERPSTUNPort:     p.DERPSTUNPort,
+		DERPRegionCode:   p.DERPRegionCode,
+		DERPRegionName:   p.DERPRegionName,
+		ReliabilityStats: p.ReliabilityStats,
 	}
 
 	s.mu.RLock()

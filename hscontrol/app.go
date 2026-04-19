@@ -180,6 +180,15 @@ func NewHeadscale(cfg *types.Config) (*Headscale, error) {
 		cfg.MeshIsConnectedAnywhere = func(id uint64) bool {
 			return app.Mesh.IsConnectedAnywhere(id)
 		}
+
+		// Historical reliability persistence (§11): the prober writes
+		// one row per (peer_name, hour_bucket) into peer_reliability
+		// every cycle. DB handle is routed through the mesh state
+		// rather than handed straight to the prober so tests can fake
+		// it out without a real gorm instance.
+		if hsdb := s.DB(); hsdb != nil {
+			app.Mesh.SetRecorder(hsdb)
+		}
 	}
 
 	// Derive the cluster identity from the shared secret + this
@@ -611,6 +620,7 @@ func (h *Headscale) createRouter(grpcMux *grpcRuntime.ServeMux) *chi.Mux {
 	r.Method(http.MethodGet, "/mesh/info", mesh.Handler(h.Mesh))
 	r.Method(http.MethodPost, "/mesh/join", mesh.JoinHandler(h.Mesh))
 	r.Method(http.MethodGet, "/mesh/identity", mesh.IdentityHandler(h.Mesh))
+	r.Method(http.MethodGet, "/mesh/history/*", mesh.HistoryHandler(h.Mesh))
 	r.Get("/register/{auth_id}", h.authProvider.RegisterHandler)
 	r.Get("/auth/{auth_id}", h.authProvider.AuthHandler)
 
@@ -787,6 +797,11 @@ func (h *Headscale) Serve() error {
 		// currently-bound section dies has no relay alternative — it can
 		// only fall back to direct UDP, which fails behind symmetric NAT.
 		go h.runDERPFleetMerge(scheduleCtx, baseDERPMap)
+
+		// Active throughput probe (§11). No-op when
+		// mesh.throughput_probe is false (the default), so nothing
+		// happens unless the operator opts in.
+		go h.Mesh.RunThroughputProbe(scheduleCtx, h.cfg.Mesh)
 	}
 
 	if zl.GlobalLevel() == zl.TraceLevel {

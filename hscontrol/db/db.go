@@ -722,6 +722,20 @@ WHERE tags IS NOT NULL AND tags != '[]' AND tags != '';
 				},
 				Rollback: func(db *gorm.DB) error { return nil },
 			},
+			{
+				// Peer-stats tables for §11 historical reliability +
+				// speed stats. Two append-only tables, never pruned:
+				// peer_reliability (one row per (peer_name, hour_bucket))
+				// and peer_throughput (one row per throughput probe
+				// sample). Dialect-aware DDL in peerstats.go keeps types
+				// correct for both sqlite and postgres without leaning
+				// on AutoMigrate.
+				ID: "202604191200-peer-stats",
+				Migrate: func(tx *gorm.DB) error {
+					return createPeerStatsTables(tx)
+				},
+				Rollback: func(db *gorm.DB) error { return nil },
+			},
 		},
 	)
 
