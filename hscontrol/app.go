@@ -208,6 +208,13 @@ func NewHeadscale(cfg *types.Config) (*Headscale, error) {
 			Str("self", cfg.Mesh.SelfName).
 			Str("verifier", id.Verifier()).
 			Msg("mesh: cluster identity derived — print this verifier to users on first contact")
+		if cfg.TLS.DeriveFromClusterSecret {
+			spki, err := mesh.DeriveTLSCertSPKI(cfg.Mesh.ClusterSecret)
+			if err != nil {
+				return nil, fmt.Errorf("derive cluster tls spki: %w", err)
+			}
+			app.Mesh.SetTLSSPKI(spki)
+		}
 	}
 
 	// Expose the mesh snapshot to the mapper via Config so TailNode
@@ -1140,6 +1147,31 @@ func (h *Headscale) Serve() error {
 
 func (h *Headscale) getTLSSettings() (*tls.Config, error) {
 	var err error
+
+	if h.cfg.TLS.DeriveFromClusterSecret {
+		if h.cfg.Mesh.ClusterSecret == "" {
+			return nil, errors.New(
+				"tls.derive_from_cluster_secret requires mesh.cluster_secret to be set",
+			)
+		}
+		cert, spki, err := mesh.DeriveTLSCert(h.cfg.Mesh.ClusterSecret)
+		if err != nil {
+			return nil, fmt.Errorf("derive tls cert from cluster secret: %w", err)
+		}
+		if !strings.HasPrefix(h.cfg.ServerURL, "https://") {
+			log.Warn().
+				Str("server_url", h.cfg.ServerURL).
+				Msg("tls.derive_from_cluster_secret set but server_url is not https://; clients will refuse to connect")
+		}
+		log.Info().
+			Str("spki_sha256", spki).
+			Msg("serving HTTPS with cluster-secret-derived cert (pin published at /mesh/identity)")
+		return &tls.Config{
+			NextProtos:   []string{"http/1.1"},
+			Certificates: []tls.Certificate{cert},
+			MinVersion:   tls.VersionTLS12,
+		}, nil
+	}
 
 	if h.cfg.TLS.LetsEncrypt.Hostname != "" {
 		if !strings.HasPrefix(h.cfg.ServerURL, "https://") {

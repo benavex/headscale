@@ -132,6 +132,52 @@ func TestVerifierFromClusterPubMatches(t *testing.T) {
 }
 
 // TestAsResponseFieldsNonEmpty: the on-wire response for
+// TestDeriveTLSCertDeterministic: byte-identical across calls, so every
+// sibling holds the same cert and clients can pin once and trust all.
+func TestDeriveTLSCertDeterministic(t *testing.T) {
+	secret := "tls-repro-secret"
+	a, spkiA, err := DeriveTLSCert(secret)
+	if err != nil {
+		t.Fatalf("first derive: %v", err)
+	}
+	b, spkiB, err := DeriveTLSCert(secret)
+	if err != nil {
+		t.Fatalf("second derive: %v", err)
+	}
+	if !bytes.Equal(a.Certificate[0], b.Certificate[0]) {
+		t.Fatal("derived cert bytes differ across calls — signing must be deterministic")
+	}
+	if spkiA != spkiB {
+		t.Fatalf("spki hash differs: %s vs %s", spkiA, spkiB)
+	}
+	if len(spkiA) != 64 { // hex of 32 bytes
+		t.Fatalf("spki hex wrong size: %d", len(spkiA))
+	}
+}
+
+// TestDeriveTLSCertDifferentSecret: cert key rotates with the cluster
+// secret, so a forged cluster with a different secret can't impersonate.
+func TestDeriveTLSCertDifferentSecret(t *testing.T) {
+	_, spkiA, err := DeriveTLSCert("secret-A")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, spkiB, err := DeriveTLSCert("secret-B")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if spkiA == spkiB {
+		t.Fatal("spki must differ across cluster secrets")
+	}
+}
+
+// TestDeriveTLSCertEmpty: empty secret returns error (matches DeriveIdentity).
+func TestDeriveTLSCertEmpty(t *testing.T) {
+	if _, _, err := DeriveTLSCert(""); err == nil {
+		t.Fatal("expected error on empty secret")
+	}
+}
+
 // /mesh/identity must always include hex-encoded fields of the
 // expected sizes. A silent truncation would fail-open clients.
 func TestAsResponseFieldsNonEmpty(t *testing.T) {
@@ -139,7 +185,7 @@ func TestAsResponseFieldsNonEmpty(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	r := id.AsResponse()
+	r := id.AsResponse("")
 	if len(r.ClusterPub) != ed25519.PublicKeySize*2 { // hex of 32 bytes
 		t.Errorf("cluster pub hex wrong len: %q", r.ClusterPub)
 	}

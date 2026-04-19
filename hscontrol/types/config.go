@@ -198,6 +198,14 @@ type TLSConfig struct {
 	CertPath string
 	KeyPath  string
 
+	// DeriveFromClusterSecret, when true, derives the TLS cert + key
+	// deterministically from mesh.cluster_secret via HKDF. Every sibling
+	// produces an identical self-signed cert; clients trust by SPKI
+	// hash published in /mesh/identity, not by CA chain or hostname.
+	// Takes precedence over CertPath and LetsEncrypt when set. Requires
+	// mesh.cluster_secret to be non-empty.
+	DeriveFromClusterSecret bool
+
 	LetsEncrypt LetsEncryptConfig
 }
 
@@ -648,6 +656,7 @@ func LoadConfig(path string, isFile bool) error {
 
 	viper.SetDefault("tls_letsencrypt_cache_dir", "/var/www/.cache")
 	viper.SetDefault("tls_letsencrypt_challenge_type", HTTP01ChallengeType)
+	viper.SetDefault("tls_derive_from_cluster_secret", false)
 
 	viper.SetDefault("log.level", "info")
 	viper.SetDefault("log.format", TextLogFormat)
@@ -924,6 +933,7 @@ func validateServerConfig() error {
 
 func tlsConfig() TLSConfig {
 	return TLSConfig{
+		DeriveFromClusterSecret: viper.GetBool("tls_derive_from_cluster_secret"),
 		LetsEncrypt: LetsEncryptConfig{
 			Hostname: viper.GetString("tls_letsencrypt_hostname"),
 			Listen:   viper.GetString("tls_letsencrypt_listen"),

@@ -26,12 +26,18 @@ package mesh
 
 import (
 	"crypto/ed25519"
+	"crypto/rand"
 	"crypto/sha256"
+	"crypto/tls"
+	"crypto/x509"
+	"crypto/x509/pkix"
 	"encoding/base32"
 	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
+	"math/big"
+	"time"
 
 	"golang.org/x/crypto/hkdf"
 )
@@ -40,6 +46,11 @@ import (
 // procedure in a future release (different curve, different label)
 // doesn't overlap with existing deployments' keys.
 const clusterIdentityHKDFLabel = "headscale-cluster-identity-v1"
+
+// clusterTLSHKDFLabel is the HKDF label for the TLS cert keypair.
+// Different from the identity label so the two keys don't overlap even
+// though they share the same cluster secret.
+const clusterTLSHKDFLabel = "headscale-cluster-tls-v1"
 
 // Identity is the fully-materialised cluster identity for this instance:
 // derived keypair, signature over the noise pubkey, and verifier.
@@ -136,6 +147,74 @@ func VerifierFromClusterPub(pub []byte) string {
 	return base32.StdEncoding.WithPadding(base32.NoPadding).EncodeToString(sum[:5])
 }
 
+// DeriveTLSCert returns a deterministic self-signed ed25519 TLS cert +
+// private key derived from the cluster secret. Every sibling with the
+// same secret produces byte-identical output, so a client can pin the
+// cert's SPKI hash once and trust any sibling that presents it.
+//
+// The cert's subject/SAN/validity are fixed placeholders — clients
+// MUST skip standard chain and hostname verification and validate
+// trust via the SPKI pin instead. The SPKI is the SHA-256 of the
+// DER-encoded SubjectPublicKeyInfo; it is returned hex-encoded so it
+// can be shipped alongside the verifier on the wire.
+//
+// ed25519 signatures in Go ignore the `rand` argument, so the whole
+// derivation is deterministic given a fixed secret. The 2020-2120
+// validity window is intentional: the cert rotates when the cluster
+// secret rotates, not on a timer.
+func DeriveTLSCert(secret string) (tls.Certificate, string, error) {
+	if secret == "" {
+		return tls.Certificate{}, "", errors.New("cluster secret not configured")
+	}
+	r := hkdf.New(sha256.New, []byte(secret), nil, []byte(clusterTLSHKDFLabel))
+	seed := make([]byte, ed25519.SeedSize)
+	if _, err := io.ReadFull(r, seed); err != nil {
+		return tls.Certificate{}, "", fmt.Errorf("hkdf: %w", err)
+	}
+	priv := ed25519.NewKeyFromSeed(seed)
+	pub := priv.Public().(ed25519.PublicKey)
+
+	notBefore := time.Date(2020, 1, 1, 0, 0, 0, 0, time.UTC)
+	notAfter := time.Date(2120, 1, 1, 0, 0, 0, 0, time.UTC)
+
+	tmpl := &x509.Certificate{
+		SerialNumber: big.NewInt(1),
+		Subject: pkix.Name{
+			CommonName: "headscale-cluster",
+		},
+		NotBefore:             notBefore,
+		NotAfter:              notAfter,
+		KeyUsage:              x509.KeyUsageDigitalSignature | x509.KeyUsageCertSign,
+		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth, x509.ExtKeyUsageClientAuth},
+		BasicConstraintsValid: true,
+		IsCA:                  true,
+		DNSNames:              []string{"headscale-cluster.local"},
+	}
+
+	derBytes, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, pub, priv)
+	if err != nil {
+		return tls.Certificate{}, "", fmt.Errorf("create certificate: %w", err)
+	}
+	cert, err := x509.ParseCertificate(derBytes)
+	if err != nil {
+		return tls.Certificate{}, "", fmt.Errorf("parse certificate: %w", err)
+	}
+	spki := sha256.Sum256(cert.RawSubjectPublicKeyInfo)
+
+	return tls.Certificate{
+		Certificate: [][]byte{derBytes},
+		PrivateKey:  priv,
+		Leaf:        cert,
+	}, hex.EncodeToString(spki[:]), nil
+}
+
+// DeriveTLSCertSPKI returns only the SPKI hash from DeriveTLSCert.
+// Convenient for handlers that only need to publish the hash.
+func DeriveTLSCertSPKI(secret string) (string, error) {
+	_, spki, err := DeriveTLSCert(secret)
+	return spki, err
+}
+
 // VerifyNoisePub returns nil iff sig is a valid ed25519 signature over
 // noisePub under the cluster pubkey. Used on the client side to
 // validate sibling control servers before rotating ControlURL to them.
@@ -168,12 +247,22 @@ type IdentityResponse struct {
 	// see in their server logs / CLI; never trust this field for
 	// authorisation — always re-derive from ClusterPub client-side.
 	Verifier string `json:"verifier"`
+
+	// TLSSPKI is the SHA-256 hash of the DER-encoded SubjectPublicKeyInfo
+	// of the derived TLS cert, hex-encoded. Empty when the server is
+	// running with its own cert (LetsEncrypt or CertPath). Published so
+	// clients can pin the cluster's TLS key alongside its noise key and
+	// refuse any TLS dial — to control plane OR DERP — whose cert's SPKI
+	// doesn't match. Derived from the same cluster secret that produces
+	// ClusterPub, so the two rotate as one unit.
+	TLSSPKI string `json:"tls_spki,omitempty"`
 }
 
 // AsResponse returns the wire form of this identity. Safe to call when
 // id is nil: returns a zero-valued response the handler can translate
-// into a 404.
-func (id *Identity) AsResponse() IdentityResponse {
+// into a 404. tlsSPKI is the hex SHA-256 of the derived TLS cert's
+// SPKI when DeriveFromClusterSecret is enabled; pass "" otherwise.
+func (id *Identity) AsResponse(tlsSPKI string) IdentityResponse {
 	if id == nil {
 		return IdentityResponse{}
 	}
@@ -182,5 +271,6 @@ func (id *Identity) AsResponse() IdentityResponse {
 		NoisePub:   hex.EncodeToString(id.NoisePub),
 		Signature:  hex.EncodeToString(id.NoiseSig),
 		Verifier:   id.Verifier(),
+		TLSSPKI:    tlsSPKI,
 	}
 }

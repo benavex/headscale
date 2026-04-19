@@ -162,6 +162,11 @@ type State struct {
 	// cluster secret is configured.
 	identity *Identity
 
+	// tlsSPKI is the hex SHA-256 of the cluster-derived TLS cert's
+	// SubjectPublicKeyInfo, published in /mesh/identity. Empty unless
+	// tls.derive_from_cluster_secret is on. Set by [State.SetTLSSPKI].
+	tlsSPKI string
+
 	// recorder persists probe outcomes and throughput samples to the
 	// peer_reliability / peer_throughput tables. Nil for mesh-only
 	// test rigs; RecordProbe / ComputeStats are no-ops when unset.
@@ -297,6 +302,28 @@ func (s *State) Identity() *Identity {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return s.identity
+}
+
+// SetTLSSPKI records the hex SHA-256 of the cluster-derived TLS cert's
+// SubjectPublicKeyInfo so /mesh/identity can publish it. Pass "" to
+// clear (used when the server is running with its own CA-issued cert).
+func (s *State) SetTLSSPKI(spki string) {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.tlsSPKI = spki
+}
+
+// TLSSPKI returns the SPKI hash set by [State.SetTLSSPKI], or "".
+func (s *State) TLSSPKI() string {
+	if s == nil {
+		return ""
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.tlsSPKI
 }
 
 // RecordConnect notes that a tailnet node's long-poll session is now
@@ -1001,7 +1028,7 @@ func IdentityHandler(s *State) http.Handler {
 		}
 		w.Header().Set("Content-Type", "application/json")
 		w.Header().Set("Cache-Control", "no-store")
-		_ = json.NewEncoder(w).Encode(id.AsResponse())
+		_ = json.NewEncoder(w).Encode(id.AsResponse(s.TLSSPKI()))
 	})
 }
 
